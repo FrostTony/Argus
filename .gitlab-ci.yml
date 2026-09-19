@@ -1,0 +1,28 @@
+stages: [check, build]
+
+default:
+  image: golang:1.24
+
+variables:
+  GOFLAGS: -mod=mod
+
+lint:
+  stage: check
+  script:
+    - test -z "$(gofmt -l .)" || { gofmt -l .; echo "run gofmt -w ."; exit 1; }
+    - go vet ./...
+
+test:
+  stage: check
+  script:
+    - go test -race ./...
+
+build:
+  stage: build
+  script:
+    # Only a tag stamps a version.
+    - make build VERSION="$CI_COMMIT_TAG"
+    - ./argus version
+  artifacts:
+    paths: [argus]
+    expire_in: 1 week

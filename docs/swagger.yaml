@@ -1,0 +1,784 @@
+openapi: 3.1.0
+
+# The HTTP surface of one argus node. Kept here as a file rather than served by
+# the node: an agent's job is to probe, and a spec it hands out is one more
+# endpoint to authorise, cache and keep from drifting. Point Swagger UI,
+# Postman or a code generator at this file.
+#
+#   docker run -p 8080:8080 -e SWAGGER_JSON=/spec/swagger.yaml \
+#     -v "$PWD/docs:/spec" swaggerapi/swagger-ui
+
+info:
+  title: Argus
+  version: "0.0.1"
+  summary: Active monitoring for domains.
+  description: |
+    A node probes the targets in its configuration and exposes what it found.
+    Everything under `/api` exists to run and change those checks from outside;
+    everything else is what a scraper or a person reads.
+
+    **Permissions.** Reading and writing are separate, and each is configured on
+    its own (`http.api.read_auth` / `write_auth`, either `token` or `none`).
+    A read token never authorises a change: handing a dashboard the operator's
+    token would be handing it the power to repoint the node. `/metrics` and the
+    status pages carry no token at all — they hold no secrets, and a scraper has
+    none to offer.
+
+    **The API is off by default.** It appears only with `http.api.enabled: true`.
+    Without it every path below `/api` is a 404.
+
+servers:
+  - url: http://{host}:{port}
+    variables:
+      host: {default: localhost}
+      port: {default: "6767"}
+
+tags:
+  - name: exposition
+    description: What a scraper reads. No authentication.
+  - name: status
+    description: What a person reads. No authentication.
+  - name: config
+    description: The check configuration. Read and write are separate rights.
+  - name: checks
+    description: Running a check now, rather than at its interval.
+
+paths:
+  /metrics:
+    get:
+      tags: [exposition]
+      summary: Prometheus exposition
+      description: |
+        Every series the node currently holds, in the text exposition format.
+        The path is `http.metrics_path` and can be moved. The paths the node
+        already serves — the status pages, `/healthz` and the four under `/api` —
+        are refused as a value for it, because registering a handler twice is a
+        crash at startup for what is only a typo.
+
+        Series older than `probing.stale_after` are not exposed: a node that
+        fans out across addresses that change on their own would otherwise
+        report yesterday's backend as down forever.
+      security: []
+      responses:
+        "200":
+          description: The exposition.
+          content:
+            text/plain:
+              schema: {type: string}
+              example: |
+                # HELP argus_probe_up Whether the last probe of this backend succeeded.
+                # TYPE argus_probe_up gauge
+                argus_probe_up{backend="142.250.74.46:443",probe="web",target="https://www.google.com/"} 1
+
+  /healthz:
+    get:
+      tags: [exposition]
+      summary: Liveness
+      description: Answers as soon as the listener is up. It says nothing about the targets.
+      security: []
+      responses:
+        "200":
+          description: The node is serving.
+          content:
+            text/plain:
+              schema: {type: string}
+              example: "ok\n"
+
+  /:
+    get:
+      tags: [status]
+      summary: Status page
+      description: |
+        A single self-contained page: what every probe found on its last run,
+        with per-backend charts. The node keeps no history, so the trends are
+        built in the browser from the snapshots below and die with the tab.
+        Also served at `/status`.
+      security: []
+      responses:
+        "200":
+          description: The page.
+          content:
+            text/html:
+              schema: {type: string}
+
+  /status:
+    get:
+      tags: [status]
+      summary: Status page
+      description: The same page as `/`.
+      security: []
+      responses:
+        "200":
+          description: The page.
+          content:
+            text/html:
+              schema: {type: string}
+
+  /logo.png:
+    get:
+      tags: [status]
+      summary: The mark the status page wears
+      description: |
+        Carried in the binary, so a node in a closed network renders the same as
+        one with a route to the internet. Served beside the page rather than
+        inlined into it, so a browser fetches it once for a page that is meant
+        to be reloaded often.
+      security: []
+      responses:
+        "200":
+          description: A PNG, about ten kilobytes.
+          content:
+            image/png:
+              schema: {type: string, format: binary}
+        "304":
+          description: Unchanged since the client last asked.
+
+  /status/data:
+    get:
+      tags: [status]
+      summary: What the page polls
+      description: |
+        Every metric the last run recorded, grouped the way a person reads it:
+        probe, target, backend. A fresh snapshot each time — nothing about the
+        previous answer is remembered here.
+      security: []
+      responses:
+        "200":
+          description: The current state.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/StateView"}
+
+  /status.json:
+    get:
+      tags: [status]
+      summary: What the node checks
+      description: |
+        The configuration as the node has it, after defaults, templates and
+        discovery — not the metrics. This is the endpoint a controller polls to
+        see whether a node picked up what it was given.
+      security: []
+      responses:
+        "200":
+          description: The node's own summary.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Status"}
+
+  /probe:
+    get:
+      tags: [checks]
+      summary: Check one target and answer with a Prometheus exposition
+      description: |
+        The other way round: Prometheus names the target and gets
+        the measurements back, so the list of targets lives in its service
+        discovery rather than in this node's configuration. Nothing is stored,
+        exactly as for `/api/check`.
+
+        Alongside the probe's own metrics it returns `probe_success`, one series
+        per target. `probe_up` cannot answer "did the check pass": it is per
+        backend, and a target that stopped resolving has none at all, so an
+        alert written over it quietly stops firing at the worst moment.
+
+        Names carry the node's prefix (`argus_` by default). Bare names
+        would put one measurement under two names in the same Prometheus, which
+        costs more than the relabel rule it saves.
+
+        **Permission.** The same rule as `/api/check`: a configured probe run as
+        configured is a read; naming `target` is a write, because that is an
+        address this node will connect to carrying whatever credentials the
+        probe holds. A scrape config supplies the token with `authorization`.
+
+        Served only when `http.api.probe_endpoint` is true, which is the
+        default. Turned off, the path is not mounted at all.
+      security: [{readToken: []}]
+      parameters:
+        - name: probe
+          in: query
+          required: false
+          description: The configured probe to run. `module` is accepted as an alias.
+          schema: {type: string}
+          example: web
+        - name: module
+          in: query
+          required: false
+          description: An alias for `probe`, so an existing scrape config needs no rewriting.
+          schema: {type: string}
+        - name: target
+          in: query
+          required: false
+          description: Check this target instead of the probe's own. Supplying it makes the request a write.
+          schema: {type: string}
+          example: https://www.google.com/
+      responses:
+        "200":
+          description: |
+            The check ran. A target that is down is a successful answer to the
+            question asked, so the status describes the request and
+            `probe_success` describes the target.
+          content:
+            text/plain:
+              schema: {type: string}
+              example: |
+                # HELP argus_probe_success Whether the on-demand check of this target passed.
+                # TYPE argus_probe_success gauge
+                argus_probe_success{probe="web",target="https://www.google.com/"} 1
+        "400":
+          description: No such probe, or the request did not describe a check.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "405": {$ref: "#/components/responses/MethodNotAllowed"}
+
+  /api/config:
+    get:
+      tags: [config]
+      summary: Read the check configuration
+      description: |
+        The configuration as loaded, not as resolved: templates and defaults are
+        still there, so what comes back can be sent straight back in.
+      security: [{readToken: []}]
+      responses:
+        "200":
+          description: The configuration, in YAML.
+          content:
+            application/yaml:
+              schema: {type: string}
+              example: |
+                defaults: {interval: 30s}
+                probes:
+                  - name: web
+                    type: http
+                    targets: ["https://www.google.com/"]
+                    http: {}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    put:
+      tags: [config]
+      summary: Replace the check configuration
+      description: |
+        Parsed exactly as a file is — an unknown field is an error, not a probe
+        that runs happily while checking the wrong thing, and `${VAR}` is
+        expanded — then applied, then written back to the file the node started
+        from. What is written is the request body as it arrived: comments and
+        `${VAR}` references survive, and a secret taken from the environment
+        does not reach the disk.
+
+        The order matters. Building the probes is the rest of the validation, so
+        a configuration this node cannot run never reaches the file; and a change
+        that cannot be written is refused outright, because applying it in memory
+        alone is how a node and its files drift apart.
+
+        Writing needs a single destination: `PUT` replaces the whole
+        configuration, and putting that back into a directory would mean deciding
+        which of the files already there to delete. A node started with
+        `-probes <dir>` or several paths answers 409 and says so in its log at
+        startup.
+
+        Probes whose definition did not change keep running, with their tickers
+        untouched: a node reloaded often must not stampede its targets.
+
+        `POST` does the same thing.
+      security: [{writeToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/yaml:
+            schema: {type: string}
+            example: |
+              probes:
+                - name: web
+                  type: http
+                  targets: ["https://www.google.com/"]
+                  http: {}
+      responses:
+        "200":
+          description: Applied and written. The body is the node's new state.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Status"}
+        "400":
+          description: |
+            The configuration was refused and nothing changed — a syntax error,
+            an unknown field, a probe type this build does not have, a timeout
+            longer than its interval. The running checks are untouched.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409":
+          description: |
+            This node has no single check file to write to, so the change was
+            not applied at all.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+              example:
+                error: >-
+                  this node has no single check file to write to, so a change
+                  through the API would not survive a restart; edit the file and
+                  reload instead
+        "500":
+          description: |
+            Applied but not saved. The node is running this configuration and the
+            file still holds the previous one, so a restart will undo it. The
+            message says so rather than leaving the operator to guess which of
+            the two is live.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "405": {$ref: "#/components/responses/MethodNotAllowed"}
+    post:
+      tags: [config]
+      summary: Replace the check configuration
+      description: The same as `PUT`.
+      security: [{writeToken: []}]
+      requestBody:
+        required: true
+        content:
+          application/yaml:
+            schema: {type: string}
+      responses:
+        "200":
+          description: Applied and written.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Status"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409":
+          description: No single check file to write to.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "500":
+          description: Applied but not saved.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+
+  /api/reload:
+    post:
+      tags: [config]
+      summary: Re-read the configuration files
+      description: |
+        What SIGHUP does. The files the node was started with are read again, so
+        an edit made on disk takes effect without a restart. Probes that did not
+        change keep running.
+      security: [{writeToken: []}]
+      responses:
+        "200":
+          description: Reloaded. The body is the node's new state.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Status"}
+        "400":
+          description: |
+            The files were refused, or the node was started with none. Nothing
+            changed.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "405": {$ref: "#/components/responses/MethodNotAllowed"}
+
+  /api/probes:
+    post:
+      tags: [checks]
+      summary: Run a probe now
+      description: |
+        Runs one probe — or every probe, with no `name` — without waiting for its
+        interval, and records the result like any other run. This is how a deploy
+        verifies a new check.
+
+        Unlike `/api/check`, this one writes to the store: it is a real run,
+        brought forward.
+      security: [{writeToken: []}]
+      parameters:
+        - name: name
+          in: query
+          required: false
+          description: The probe to run. Omitted, every probe runs.
+          schema: {type: string}
+          example: web
+      responses:
+        "200":
+          description: The run finished.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ran: {type: string, description: The probe that ran, or "all".}
+                required: [ran]
+              example: {ran: web}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404":
+          description: No probe of that name is configured on this node.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "409":
+          description: |
+            That probe is already running. Two runs of one probe would report
+            each other's results, so the second is refused rather than queued.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "405": {$ref: "#/components/responses/MethodNotAllowed"}
+
+  /api/check:
+    get:
+      tags: [checks]
+      summary: Check something once, storing nothing
+      description: |
+        Ask a question and read the answer inline. Nothing reaches the store: a
+        one-off check run by a person debugging a target must not leave a series
+        behind that a dashboard then treats as monitoring data.
+
+        **The permission depends on what is asked.** Running a configured probe
+        exactly as configured is a read. Pointing it at another address
+        (`target`) is a write, because it sends that probe's configured
+        credentials somewhere the caller chose.
+      security: [{readToken: []}]
+      parameters:
+        - {$ref: "#/components/parameters/CheckProbe"}
+        - {$ref: "#/components/parameters/CheckTarget"}
+        - {$ref: "#/components/parameters/CheckDebug"}
+      responses:
+        "200":
+          description: |
+            The check ran. A target that is down is a successful answer to the
+            question that was asked, so the status describes the API call and
+            `success` describes the target.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CheckResult"}
+        "400":
+          description: No such probe, or the request did not describe a check.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "405": {$ref: "#/components/responses/MethodNotAllowed"}
+    post:
+      tags: [checks]
+      summary: Check a probe definition that is not in the configuration
+      description: |
+        The body is a probe definition, parsed as strictly as one in a file. This
+        is always a write: a definition can name the `external` prober, which
+        runs a command on this node.
+
+        With an empty body this behaves exactly like `GET`.
+      security: [{writeToken: []}]
+      parameters:
+        - {$ref: "#/components/parameters/CheckProbe"}
+        - {$ref: "#/components/parameters/CheckTarget"}
+        - {$ref: "#/components/parameters/CheckDebug"}
+      requestBody:
+        required: false
+        content:
+          application/yaml:
+            schema: {type: string}
+            example: |
+              name: ad-hoc
+              type: http
+              targets: ["https://www.google.com/"]
+              http:
+                validators:
+                  - {name: status, status: "200-399"}
+      responses:
+        "200":
+          description: The check ran.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CheckResult"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    put:
+      tags: [checks]
+      summary: Check a probe definition that is not in the configuration
+      description: The same as `POST`.
+      security: [{writeToken: []}]
+      parameters:
+        - {$ref: "#/components/parameters/CheckProbe"}
+        - {$ref: "#/components/parameters/CheckTarget"}
+        - {$ref: "#/components/parameters/CheckDebug"}
+      requestBody:
+        required: false
+        content:
+          application/yaml:
+            schema: {type: string}
+      responses:
+        "200":
+          description: The check ran.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CheckResult"}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+components:
+  securitySchemes:
+    readToken:
+      type: http
+      scheme: bearer
+      description: |
+        `http.api.read_token`, or `http.api.token` when no read token is set.
+        Not required when `read_auth: none`.
+    writeToken:
+      type: http
+      scheme: bearer
+      description: |
+        `http.api.token`. A read token is never accepted here. Not required when
+        `write_auth: none`, which the node warns about at startup.
+
+  parameters:
+    CheckProbe:
+      name: probe
+      in: query
+      required: false
+      description: A configured probe to run. Leave it out when the body carries a definition.
+      schema: {type: string}
+      example: web
+    CheckTarget:
+      name: target
+      in: query
+      required: false
+      description: |
+        Check this one target instead of the probe's own. Supplying it makes the
+        request a write.
+      schema: {type: string}
+      example: https://staging.google.com/
+    CheckDebug:
+      name: debug
+      in: query
+      required: false
+      description: Return the run's log alongside the result.
+      schema: {type: boolean, default: false}
+
+  responses:
+    Unauthorized:
+      description: The token is missing or does not grant this action.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example: {error: unauthorized}
+    BadRequest:
+      description: The request was refused and nothing changed.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    MethodNotAllowed:
+      description: Wrong method for this path.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: |
+            What went wrong, in a sentence. Failures name the thing that failed —
+            the field, the probe, the file — because the next step after reading
+            this is fixing it.
+      required: [error]
+
+    Status:
+      type: object
+      description: What the node currently checks. No metrics.
+      properties:
+        node: {type: string, description: This node's name, which every series carries as a label.}
+        uptime: {type: string, example: 3h12m4s}
+        series: {type: integer, description: Series held in the metric store.}
+        resolver: {type: string, enum: [system, custom]}
+        probes:
+          type: array
+          items: {$ref: "#/components/schemas/ProbeStatus"}
+      required: [node, uptime, series, resolver, probes]
+
+    ProbeStatus:
+      type: object
+      description: One probe as the node has it, after defaults, templates and discovery.
+      properties:
+        name: {type: string}
+        type: {type: string, example: http}
+        interval: {type: string, example: 30s}
+        timeout: {type: string, example: 5s}
+        per_backend:
+          type: boolean
+          description: Whether every resolved address is checked separately.
+        sleeping:
+          type: boolean
+          description: Whether the probe's schedule has it paused right now.
+        negative:
+          type: boolean
+          description: |
+            The probe passes when the check fails — a blocklist, a WAF rule, a
+            decommissioned endpoint. A green row here does not mean the endpoint
+            answers.
+        failures:
+          type: object
+          additionalProperties: {type: string}
+          description: |
+            `"target|backend"` to the message behind a current failure.
+            "connect" is a category; this is the sentence a person needs.
+          example:
+            "https://www.google.com/|142.250.74.46:443": "status: got 503, want 200-399"
+        targets:
+          type: array
+          items: {type: string}
+      required: [name, type, interval, timeout, per_backend, targets]
+
+    StateView:
+      type: object
+      description: |
+        Everything the node knows right now, and nothing it knew before. The
+        history behind the page's charts lives in the browser tab.
+      properties:
+        node: {type: string}
+        version: {type: string}
+        uptime: {type: string}
+        stale_after:
+          type: string
+          description: How long a series survives without being written again.
+        time: {type: integer, description: Unix milliseconds this snapshot was taken.}
+        up: {type: integer, description: Backends that answered.}
+        down: {type: integer, description: Backends that did not.}
+        series: {type: integer}
+        probes:
+          type: array
+          items: {$ref: "#/components/schemas/ProbeState"}
+      required: [node, version, uptime, stale_after, time, up, down, series, probes]
+
+    ProbeState:
+      type: object
+      properties:
+        name: {type: string}
+        type: {type: string}
+        interval: {type: string}
+        sleeping: {type: boolean}
+        negative: {type: boolean}
+        targets:
+          type: array
+          items: {$ref: "#/components/schemas/TargetState"}
+      required: [name, type, interval, targets]
+
+    TargetState:
+      type: object
+      properties:
+        target: {type: string}
+        up: {type: integer}
+        total: {type: integer}
+        resolve: {type: number, description: Seconds the name took, apart from the request.}
+        error:
+          type: string
+          description: |
+            Set when the target never got as far as a backend, which in practice
+            means it stopped resolving.
+        stats:
+          type: object
+          additionalProperties: {type: number}
+          description: The metrics that belong to the target rather than to one of its addresses.
+        backends:
+          type: array
+          items: {$ref: "#/components/schemas/BackendState"}
+      required: [target, up, total, backends]
+
+    BackendState:
+      type: object
+      description: Every metric the probe recorded for one address, split by how it is read.
+      properties:
+        backend: {type: string, example: "93.184.216.34:443"}
+        family: {type: string, enum: [ipv4, ipv6]}
+        up: {type: boolean}
+        reason:
+          type: string
+          description: Which stage broke.
+          enum: [dns, connect, tls, timeout, protocol, status, content, internal, unknown]
+        error:
+          type: string
+          description: What actually happened, which is what the page was opened to find out.
+        latency: {type: number, description: Seconds the last probe took.}
+        age: {type: number, description: Days until the leaf certificate expires, where there is one.}
+        phases:
+          type: object
+          additionalProperties: {type: number}
+          example: {connect: 0.012, tls: 0.031, ttfb: 0.08, transfer: 0.004}
+        gauges:
+          type: object
+          additionalProperties: {type: number}
+        counters:
+          type: object
+          additionalProperties: {type: number}
+        info:
+          type: object
+          additionalProperties: {type: string}
+        hist:
+          type: object
+          additionalProperties: {$ref: "#/components/schemas/Histogram"}
+      required: [up]
+
+    Histogram:
+      type: object
+      description: A distribution without its buckets — enough to read, small enough to poll.
+      properties:
+        count: {type: integer}
+        mean: {type: number}
+        p50: {type: number}
+        p95: {type: number}
+      required: [count, mean, p50, p95]
+
+    CheckResult:
+      type: object
+      description: One ad-hoc check. Nothing here reached the store.
+      properties:
+        probe: {type: string}
+        type: {type: string}
+        duration: {type: string, example: 142ms}
+        success: {type: boolean}
+        targets:
+          type: array
+          items: {$ref: "#/components/schemas/TargetCheck"}
+        log:
+          type: array
+          items: {type: string}
+          description: |
+            The run's trace, with `debug=true`. The single most useful thing when
+            a check fails for a reason the metrics do not explain.
+      required: [probe, type, duration, success, targets]
+
+    TargetCheck:
+      type: object
+      properties:
+        target: {type: string}
+        resolve_seconds: {type: number}
+        backends_up: {type: integer}
+        backends_total: {type: integer}
+        error: {type: string}
+        backends:
+          type: array
+          items: {$ref: "#/components/schemas/BackendCheck"}
+      required: [target, backends_up, backends_total, backends]
+
+    BackendCheck:
+      type: object
+      properties:
+        backend: {type: string}
+        family: {type: string, enum: [ipv4, ipv6]}
+        success: {type: boolean}
+        reason:
+          type: string
+          enum: [dns, connect, tls, timeout, protocol, status, content, internal, unknown]
+        error: {type: string}
+        phases:
+          type: object
+          additionalProperties: {type: number}
+        metrics:
+          type: object
+          additionalProperties: true
+          description: What the probe measured, returned inline instead of being stored.
+      required: [success]

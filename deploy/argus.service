@@ -1,0 +1,37 @@
+[Unit]
+Description=Argus monitoring agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=argus
+Group=argus
+ExecStart=/usr/local/bin/argus run -config /etc/argus/argus.yaml -probes /etc/argus/probes.d
+# SIGHUP reloads the checks and reopens log files; nothing restarts.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5s
+
+# Unprivileged ICMP instead of NET_RAW; see sysctl net.ipv4.ping_group_range.
+AmbientCapabilities=
+CapabilityBoundingSet=
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/log/argus
+
+# A probe per backend means many short-lived sockets.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,424 @@
+# Checks. Inheritance: defaults -> template -> the probe itself.
+#
+# Everything enabled here works against the public internet, so
+#   ./argus run -config examples/argus.yaml -probes examples/probes.d
+# gives a status page with something real on it. Probes that need a host only
+# you have are marked disabled: true and are there as a shape to copy.
+
+defaults:
+  interval: 30s
+  timeout: 5s
+  # Most laptops and plenty of nodes have no IPv6 route, and every AAAA record
+  # then fails with "no route to host" — noise, not a finding. This is the knob
+  # that says so; example_web_dualstack below overrides it to show the fan-out
+  # across both families, which is the thing argus exists for.
+  ip_version: ipv4
+  labels:
+    env: prod
+
+templates:
+  # An ordinary website: GET, redirects, 2xx-3xx, non-empty body, a certificate
+  # with some life left in it.
+  web:
+    type: http
+    http:
+      method: GET
+      follow_redirects: true
+      validators:
+        - name: status
+          status_code: ["200-399"]
+        - name: not_empty
+          min_size_bytes: 100
+        - name: cert
+          cert_min_days: 14
+
+  # A JSON API: the same, plus the answer has to parse and say what it should.
+  api:
+    type: http
+    http:
+      method: GET
+      headers:
+        Accept: application/json
+      max_body_bytes: 262144
+      validators:
+        - name: status
+          status_code: [200]
+
+probes:
+  # One target, any number of backends. Argus resolves google.com itself, finds
+  # every A record and probes each address separately: the metrics gain a
+  # backend label, and resolution time gets a metric of its own.
+  - name: example_web
+    template: web
+    labels:
+      project: demo
+    targets:
+      - https://www.google.com/
+      - url: https://developers.google.com/
+        labels: {kind: docs}
+
+  # The whole point, without the family filter: every A and AAAA record of the
+  # domain checked separately. On a node with IPv6 this is four backends for one
+  # URL; on a node without it, the AAAA rows are honestly red.
+  - name: example_web_dualstack
+    template: web
+    ip_version: both
+    labels: {project: demo}
+    targets:
+      - https://www.google.com/
+
+  # An API check: its own path, headers, a JSON field that has to be right.
+  - name: example_api
+    template: api
+    interval: 15s
+    timeout: 3s
+    labels: {project: demo, kind: api}
+    targets:
+      - https://dns.google/resolve?name=google.com&type=A
+    http:
+      validators:
+        - name: answers_json
+          json_path: Status
+        - name: served_over_tls
+          require_tls: true
+
+  # HTTP/2 and a compressed body, checked explicitly: a CDN silently dropping to
+  # HTTP/1.1 is the kind of thing nobody notices for a month.
+  - name: example_http2
+    template: web
+    interval: 60s
+    labels: {project: demo}
+    targets:
+      - https://www.google.com/
+    http:
+      compression: true
+      validators:
+        - name: modern_protocol
+          http_version: ["HTTP/2.0"]
+        - name: status
+          status_code: [200]
+
+  # A redirect that must stay a redirect: the apex sending visitors to www is a
+  # contract, and following it would hide the day it breaks.
+  - name: example_redirect
+    type: http
+    interval: 60s
+    labels: {project: demo}
+    targets:
+      - http://google.com/
+    http:
+      follow_redirects: false
+      validators:
+        - name: is_redirect
+          status_code: ["300-399"]
+        - name: points_somewhere
+          header: Location
+          header_regex: "^https?://"
+
+  # A negative test: success is being refused. This is how "the admin path is
+  # closed" is checked at all — without it, a 404 and a 200 look the same to a
+  # probe that only asks whether the server answered.
+  - name: example_blocked_path
+    type: http
+    interval: 60s
+    negative_test: true
+    labels: {project: demo}
+    targets:
+      - https://www.google.com/this-path-should-not-exist
+    http:
+      validators:
+        - name: status
+          status_code: ["200-299"]
+
+  # DNS: the target is the domain and the question goes to every resolver.
+  - name: example_dns
+    type: dns
+    interval: 60s
+    labels: {project: demo}
+    targets:
+      - host: google.com
+    dns:
+      servers: ["8.8.8.8", "8.8.4.4"]
+      query_type: A
+      min_answers: 1
+
+  # The authority section carries the NS set behind a delegation and the SOA
+  # behind a negative answer; neither ever reaches the answer section, so a
+  # check that only reads answers cannot see a nameserver that was removed.
+  # require_authoritative asks the server to say it answered from the zone
+  # rather than from a cache, which is the point of asking it at all.
+  - name: example_dns_delegation
+    type: dns
+    interval: 300s
+    disabled: true
+    labels: {project: demo}
+    targets:
+      - host: google.com
+    dns:
+      servers: ["ns1.google.com:53"]
+      query_type: SOA
+      require_authoritative: true
+      authority_regex: "google\\.com"
+      # dns_soa_serial is written as a number, so "the secondary is behind the
+      # primary" is a comparison in Prometheus rather than a check configured
+      # here — and the same query across nodes answers it for the whole fleet.
+
+  # compare_servers catches zone drift: one resolver still serving the old
+  # answer after a change, or a secondary that stopped transferring.
+  #
+  # It belongs to a zone whose answer is the same everywhere, which means a zone
+  # you run. Point it at a domain behind a CDN and it is red from the first run
+  # and stays red: Cloudflare, Akamai and the rest answer each resolver with the
+  # addresses nearest to it, on purpose, and that is the service working.
+  - name: example_dns_drift
+    type: dns
+    interval: 60s
+    disabled: true
+    labels: {project: demo}
+    targets:
+      - host: internal.example.com
+    dns:
+      servers: ["10.0.0.53", "10.0.1.53"]
+      query_type: A
+      min_answers: 1
+      compare_servers: true
+
+  # The mail path of a zone is its own check: an MX that disappears is silent
+  # until somebody's mail bounces.
+  - name: example_dns_mx
+    type: dns
+    interval: 300s
+    labels: {project: demo}
+    targets:
+      - host: google.com
+    dns:
+      servers: ["8.8.8.8"]
+      query_type: MX
+      min_answers: 1
+      answer_regex: "\\."
+
+  # A name that was deliberately removed must keep answering NXDOMAIN: without
+  # this, "the zone is broken" and "the record is gone as intended" look alike.
+  # Note that a zone with a wildcard answers NOERROR with no records instead,
+  # which is a different thing and would fail this check.
+  - name: example_dns_removed
+    type: dns
+    interval: 300s
+    labels: {project: demo}
+    targets:
+      - host: this-name-does-not-exist.google.com
+    dns:
+      servers: ["8.8.8.8"]
+      valid_rcodes: ["NXDOMAIN"]
+
+  # The registration behind the domain. A certificate that expires takes one
+  # service down for an hour; a registration that expires takes the domain, its
+  # mail and everything under it, and nobody is watching a date two years out.
+  #
+  # The interval is in hours on purpose: registries rate-limit, the answer
+  # changes about once a year, and the check is worth nothing if it gets the
+  # node banned. min_days wants to be longer than a renewal takes to go through
+  # plus however long it takes somebody to notice the alert.
+  - name: example_domain
+    type: domain
+    interval: 12h
+    timeout: 20s
+    labels: {project: demo}
+    targets:
+      - host: google.com
+      - host: youtube.com
+    domain:
+      min_days: 45
+      # The transfer lock is what makes moving the domain need the auth code.
+      # Its absence is invisible from outside — the site keeps answering — and
+      # it is how a domain is taken.
+      require_status: [clientTransferProhibited]
+      forbid_status: [clientHold, pendingDelete]
+
+  # TLS separately from HTTP: a certificate lives on the connection, and one
+  # backend can be serving an expired one while the rest are fine.
+  - name: example_tls
+    type: tls
+    interval: 300s
+    timeout: 10s
+    labels: {project: demo}
+    targets:
+      - host: www.google.com
+        port: 443
+      - host: google.com
+        port: 443
+    tls:
+      min_days_left: 7
+
+  # TCP: the port is open.
+  - name: example_tcp
+    type: tcp
+    interval: 60s
+    labels: {project: demo}
+    targets:
+      - google.com:443
+    tcp:
+      port: 443
+
+  # A conversation rather than a connect: an open port only proves the kernel
+  # accepted the SYN. expect is a regular expression and its groups reach the
+  # next step as ${1}, which is how a protocol with a session id is followed.
+  - name: example_tcp_http
+    type: tcp
+    interval: 60s
+    labels: {project: demo}
+    targets:
+      - host: google.com
+        port: 80
+    tcp:
+      steps:
+        # That it answers HTTP at all is the check; which status it chooses is
+        # the http prober's business, and a port that speaks something else
+        # entirely is what this catches.
+        - send: "GET / HTTP/1.0\r\nHost: google.com\r\n\r\n"
+          expect: "^HTTP/1\\.[01] [0-9]{3}"
+
+  # ICMP: loss and jitter per backend, not just "the host replies". Unprivileged
+  # ping needs net.ipv4.ping_group_range on Linux; on macOS it works as is.
+  - name: example_icmp
+    type: icmp
+    interval: 60s
+    timeout: 10s
+    labels: {project: demo}
+    targets:
+      - host: 8.8.8.8
+      - host: 8.8.4.4
+    icmp:
+      packets: 5
+      interval: 100ms
+      max_loss_percent: 50
+
+  # A check that only runs during the working week, because paging someone at
+  # 04:00 over a batch job is worse than not checking it at all.
+  - name: example_business_hours
+    template: web
+    interval: 60s
+    labels: {project: demo}
+    targets:
+      - https://www.google.com/
+    schedule:
+      timezone: Europe/Moscow
+      windows:
+        - days: [mon, tue, wed, thu, fri]
+          from: "09:00"
+          to: "19:00"
+
+  # Three attempts per run: one lost packet is not an outage, and this is the
+  # difference between a flapping alert and a real one.
+  - name: example_retried
+    type: icmp
+    interval: 60s
+    timeout: 10s
+    requests_per_probe: 3
+    labels: {project: demo}
+    targets:
+      - host: 8.8.4.4
+    icmp:
+      packets: 3
+
+  # gRPC health check, spoken directly over HTTP/2.
+  - name: example_grpc
+    type: grpc
+    disabled: true
+    targets:
+      - host: grpc.example.com
+        port: 443
+    grpc:
+      service: ""
+
+  # UDP: a datagram and the reply we expect back.
+  - name: example_udp
+    type: udp
+    disabled: true
+    targets:
+      - host: ntp.example.com
+        port: 123
+    udp:
+      send: "ping"
+      expect: "pong"
+
+  # Without expect there is nothing to match, so the check waits instead for the
+  # ICMP port-unreachable a closed port answers with. unreachable_wait is how
+  # long: long enough for one round trip to the target, and no longer, because
+  # every run of this probe pays it.
+  - name: example_udp_open_port
+    type: udp
+    disabled: true
+    targets:
+      - host: dns.example.com
+        port: 53
+    udp:
+      send: "\0"
+      unreachable_wait: 300ms
+
+  # SMTP with STARTTLS: the greeting, the upgrade, and a certificate that is
+  # checked on the upgraded connection.
+  - name: example_smtp
+    type: tcp
+    disabled: true
+    interval: 120s
+    targets:
+      - host: mail.example.com
+        port: 25
+    tcp:
+      steps:
+        - expect: "^220 "
+        - send: "EHLO argus\r\n"
+          expect: "STARTTLS"
+          starttls: true
+        - send: "EHLO argus\r\n"
+          expect: "^250 "
+
+  # An authenticated API. Secrets come from a file, re-read on every request, so
+  # a rotated token takes effect without a restart.
+  - name: example_private_api
+    template: api
+    disabled: true
+    targets:
+      - https://api.internal.example.com/v1/health
+    http:
+      auth:
+        bearer:
+          token_file: /etc/argus/api.token
+      validators:
+        - name: alive
+          json_path: status
+          json_equals: ok
+
+  # The escape hatch: anything that exits 0 and prints "name value" lines.
+  # The target reaches the command through ARGUS_* variables and @host@ args.
+  - name: example_external
+    type: external
+    disabled: true
+    interval: 300s
+    timeout: 30s
+    targets:
+      - host: google.com
+    external:
+      command: /usr/local/bin/check-something
+      args: ["--host", "@host@", "--backend", "@backend_ip@"]
+      metric_prefix: custom_
+
+  # Targets from a discovery source instead of a list: the file is re-read on a
+  # schedule and a failed read keeps the previous list.
+  - name: discovered_web
+    template: web
+    disabled: true
+    targets:
+      file:
+        path: /etc/argus/targets.json
+      refresh: 5m
+
+  # The same configuration on every node, with each probe naming the nodes it
+  # belongs to. run_on is a regular expression over the node name.
+  - name: example_eu_only
+    template: web
+    disabled: true
+    run_on: "^(fra|ams)[0-9]+$"
+    targets:
+      - https://eu.example.com/

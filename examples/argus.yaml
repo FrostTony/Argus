@@ -1,0 +1,97 @@
+# Node configuration. Checks live separately, in probes.d/.
+
+node:
+  name: argus-local
+  labels:
+    region: eu
+    zone: fra1
+    # Node labels reach metrics prefixed with node_: node_region, node_zone.
+
+http:
+  listen: ":6767"
+  metrics_path: /metrics
+  # The status page is at / and /status. It polls /status/data and draws the
+  # trend in the browser: the node answers with the present and keeps nothing,
+  # so closing the tab loses the chart. stale_after below is the whole memory.
+  #
+  # Config API: GET/PUT /api/config, POST /api/reload, POST /api/probes?name=...
+  # and /api/check, a one-off run that stores nothing — a way of
+  # working, for debugging a target or verifying an endpoint from a pipeline.
+  api:
+    enabled: true
+    # Reading and writing are separate permissions, both requiring a token by
+    # default. Set either to "none" to open it.
+    read_auth: token
+    write_auth: token
+    token: ${ARGUS_API_TOKEN}
+    # A second token that may only read, for a dashboard that should never be
+    # able to repoint the node:
+    # read_token: ${ARGUS_READ_TOKEN}
+    #
+    # /probe runs one check and answers with a Prometheus exposition, which
+    # lets a scrape name the target: the list of targets then lives in
+    # Prometheus's service discovery rather than in probes.d/. On by default.
+    # probe_endpoint: false
+  # tls:
+  #   cert_file: /etc/argus/tls/server.crt
+  #   key_file: /etc/argus/tls/server.key
+  #   client_ca_file: /etc/argus/tls/ca.crt   # require a client certificate
+
+resolver:
+  # system: the OS resolver, like every other client on this machine.
+  # custom: our own servers, which also gives TTL and rcode.
+  mode: custom
+  servers: ["1.1.1.1", "8.8.8.8"]
+  ip_family: both
+  # Cap on addresses per target: fanning out multiplies the number of series.
+  max_backends: 8
+  min_ttl: 10s
+  max_ttl: 5m
+  stable_order: true
+
+probing:
+  interval: 60s
+  timeout: 10s
+  # Fraction of the interval the probe starts are scattered over.
+  jitter: 0.1
+  max_concurrent: 256
+  # Probe every address of a target; a probe can opt out.
+  per_backend: true
+  # Re-read probes.d/ on this interval and reload when its content changed.
+  # Zero, the default, leaves SIGHUP and the API as the only ways in — this is
+  # for a ConfigMap, which updates itself and cannot be sent a signal.
+  # watch_config: 30s
+  # A series nobody wrote for this long past its probe's interval stops being
+  # exposed. It is the backstop, and the whole memory of the status page: gauges
+  # a run did not repeat, and those of a backend that left DNS, go at once.
+  stale_after: 10m
+  # Hard ceiling on the metric store; past it new series are dropped and counted
+  # in argus_series_dropped rather than growing until the node runs out of memory.
+  max_series: 500000
+  latency_buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+
+surfacers:
+  - type: prometheus
+    prometheus:
+      prefix: argus_
+
+  # - type: file
+  #   file:
+  #     path: /var/log/argus/metrics.jsonl
+
+  # - type: remote_write
+  #   remote_write:
+  #     url: https://vm.example.com/api/v1/write
+  #     interval: 30s
+  #     basic_auth_user: argus
+  #     basic_auth_pass: ${VM_PASSWORD}
+  #     max_retries: 3
+
+logging:
+  # debug: every check; info: lifecycle and changes of state; warn: degradation;
+  # error: what needs a person.
+  level: info
+  # json (default) for a collector, text for a terminal.
+  format: json
+  # Adds the file and line that logged the record. For debugging a node.
+  source: false
