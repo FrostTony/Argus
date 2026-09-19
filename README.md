@@ -1,13 +1,17 @@
-<img src="argus-logo.png" alt="Argus" width="180" align="right">
+<p align="center">
+  <img src="argus-logo.png" alt="" width="200">
+</p>
 
-# Argus
+<h1 align="center">Argus</h1>
 
-Active monitoring for domains. Argus resolves every target itself, probes each
-address behind it separately, and exports the result as a labelled Prometheus
-metric stream.
-
-A single static binary. No agent registry, no database, no external dependency
-at runtime.
+<p align="center">
+  Active monitoring for domains. Argus resolves every target itself, probes each
+  address behind it separately, and exports the result as a labelled Prometheus
+  metric stream.
+  <br><br>
+  A single static binary. No agent registry, no database, no external dependency
+  at runtime.
+</p>
 
 ## Why per-address
 
