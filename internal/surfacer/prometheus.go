@@ -42,7 +42,7 @@ func (p *Prometheus) WriteTo(w io.Writer) (int64, error) {
 	for _, s := range samples {
 		newMetric = s.Name != lastRaw
 		if newMetric {
-			names = newMetricNames(p.Prefix + s.Name)
+			names = newMetricNames(metrics.Prefixed(p.Prefix, s.Name))
 			lastRaw = s.Name
 		}
 		name := names.base
@@ -225,11 +225,7 @@ func promType(v metrics.Value) string {
 	return "untyped"
 }
 
-func formatFloat(v float64) string {
-	return strconv.FormatFloat(v, 'g', -1, 64)
-}
-
-// String renders the whole exposition, for the CLI and tests.
+// String renders the whole exposition.
 func (p *Prometheus) String() string {
 	var sb strings.Builder
 	_, _ = p.WriteTo(&sb)

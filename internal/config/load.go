@@ -116,6 +116,14 @@ func SaveProbes(path string, data []byte) error {
 	return nil
 }
 
+// Hash is the sha256 of a configuration document, over the exact bytes that
+// were accepted. Whoever sent them can compute the same value and tell whether
+// the node is already running that configuration.
+func Hash(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
 // Fingerprint hashes the check configuration on disk, file names and content both.
 func Fingerprint(paths ...string) (string, error) {
 	files, err := expandPaths(paths)

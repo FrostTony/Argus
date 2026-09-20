@@ -40,6 +40,9 @@ type Config struct {
 	// Privileged switches to a raw socket where datagram ping is not permitted.
 	Privileged bool `yaml:"privileged"`
 	TTL        int  `yaml:"ttl"`
+	// TOS is the IPv4 type-of-service byte, or the IPv6 traffic class: the same
+	// DSCP marking the traffic under test carries, so the ping shares its queue.
+	TOS int `yaml:"tos"`
 }
 
 type Prober struct{ cfg Config }
@@ -51,6 +54,9 @@ func New(pc config.Probe) (probe.Prober, error) {
 	}
 	if cfg.Packets <= 0 {
 		return nil, fmt.Errorf("icmp.packets must be positive")
+	}
+	if cfg.TOS < 0 || cfg.TOS > 255 {
+		return nil, fmt.Errorf("icmp.tos must be 0-255, got %d", cfg.TOS)
 	}
 	if cfg.PayloadSize < tokenLen {
 		// The payload must fit the token that identifies our replies.
@@ -81,6 +87,7 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 		return res
 	}
 	id := int(binary.BigEndian.Uint16(token[:2]))
+	ech := &echoes{token: token, answered: make([]bool, p.cfg.Packets)}
 	rtts := make([]time.Duration, 0, p.cfg.Packets)
 	read := readerFor(conn)
 	hopLimit := 0
@@ -97,7 +104,7 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 				if hopLimit > 0 {
 					rec.Gauge("icmp_reply_hop_limit", float64(hopLimit))
 				}
-				return p.finish(&res, rec, rtts, sent)
+				return p.finish(&res, rec, rtts, sent, ech.dups)
 			}
 		}
 		deadline, ok := packetWindow(ctx, time.Now(), p.cfg.Packets-seq, p.cfg.Interval.D())
@@ -105,7 +112,7 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 			break
 		}
 		sent++
-		rtt, hops, err := p.exchange(conn, read, buf, proto, dst, id, seq, token, deadline)
+		rtt, hops, err := p.exchange(conn, read, buf, proto, dst, id, seq, ech, deadline)
 		if err == nil {
 			rtts = append(rtts, rtt)
 			hopLimit = hops
@@ -114,7 +121,16 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 	if hopLimit > 0 {
 		rec.Gauge("icmp_reply_hop_limit", float64(hopLimit))
 	}
-	return p.finish(&res, rec, rtts, sent)
+	return p.finish(&res, rec, rtts, sent, ech.dups)
+}
+
+// echoes is one run's bookkeeping: the token that marks our packets, which
+// sequence numbers have been answered, and how many replies arrived for a
+// sequence already answered.
+type echoes struct {
+	token    [tokenLen]byte
+	answered []bool
+	dups     int
 }
 
 // address is the backend the runner picked, or the resolved target host.
@@ -166,6 +182,11 @@ func (p *Prober) applySocketOptions(conn *icmp.PacketConn, v6 bool) error {
 				return err
 			}
 		}
+		if p.cfg.TOS > 0 {
+			if err := c.SetTrafficClass(p.cfg.TOS); err != nil {
+				return err
+			}
+		}
 		// Best effort: a datagram socket need not deliver the control message.
 		_ = c.SetControlMessage(ipv6.FlagHopLimit, true)
 		return nil
@@ -177,6 +198,11 @@ func (p *Prober) applySocketOptions(conn *icmp.PacketConn, v6 bool) error {
 	}
 	if p.cfg.TTL > 0 {
 		if err := c.SetTTL(p.cfg.TTL); err != nil {
+			return err
+		}
+	}
+	if p.cfg.TOS > 0 {
+		if err := c.SetTOS(p.cfg.TOS); err != nil {
 			return err
 		}
 	}
@@ -221,8 +247,8 @@ func destination(addr netip.Addr, privileged bool) net.Addr {
 	return &net.UDPAddr{IP: ip}
 }
 
-func (p *Prober) exchange(conn *icmp.PacketConn, read replyReader, buf []byte, proto int, dst net.Addr, id, seq int, token [tokenLen]byte, deadline time.Time) (time.Duration, int, error) {
-	body := &icmp.Echo{ID: id, Seq: seq, Data: p.payload(token)}
+func (p *Prober) exchange(conn *icmp.PacketConn, read replyReader, buf []byte, proto int, dst net.Addr, id, seq int, ech *echoes, deadline time.Time) (time.Duration, int, error) {
+	body := &icmp.Echo{ID: id, Seq: seq, Data: p.payload(ech.token)}
 	var msg icmp.Message
 	if proto == ipv4.ICMPTypeEcho.Protocol() {
 		msg = icmp.Message{Type: ipv4.ICMPTypeEcho, Body: body}
@@ -252,9 +278,23 @@ func (p *Prober) exchange(conn *icmp.PacketConn, read replyReader, buf []byte, p
 		if err != nil {
 			continue
 		}
-		if !ours(reply, seq, token[:]) {
+		got, ok := echoOf(reply, ech.token[:])
+		if !ok {
 			continue
 		}
+		if got != seq {
+			// A reply to a packet we have moved on from. The first one is
+			// simply late; a second is the path duplicating it, which a
+			// broadcast address or an anycast set does.
+			if got >= 0 && got < len(ech.answered) {
+				if ech.answered[got] {
+					ech.dups++
+				}
+				ech.answered[got] = true
+			}
+			continue
+		}
+		ech.answered[seq] = true
 		return time.Since(start), hops, nil
 	}
 }
@@ -287,14 +327,18 @@ func packetWindow(ctx context.Context, now time.Time, remaining int, gap time.Du
 	return now.Add(window), true
 }
 
-// ours matches a reply by payload token: a raw socket sees every ICMP reply on
+// echoOf returns the sequence number of a reply to one of our echoes. The
+// payload token is what identifies it: a raw socket sees every ICMP reply on
 // the host, and the kernel rewrites a datagram socket's echo id.
-func ours(m *icmp.Message, seq int, token []byte) bool {
+func echoOf(m *icmp.Message, token []byte) (int, bool) {
 	if m.Type != ipv4.ICMPTypeEchoReply && m.Type != ipv6.ICMPTypeEchoReply {
-		return false
+		return 0, false
 	}
 	echo, ok := m.Body.(*icmp.Echo)
-	return ok && echo.Seq == seq && bytes.HasPrefix(echo.Data, token)
+	if !ok || !bytes.HasPrefix(echo.Data, token) {
+		return 0, false
+	}
+	return echo.Seq, true
 }
 
 func (p *Prober) payload(token [tokenLen]byte) []byte {
@@ -304,7 +348,9 @@ func (p *Prober) payload(token [tokenLen]byte) []byte {
 }
 
 // finish reports loss and RTT over the packets actually sent.
-func (p *Prober) finish(res *probe.Result, rec *metrics.Recorder, rtts []time.Duration, sent int) probe.Result {
+// A duplicate of the last packet arrives after the run has stopped reading, so
+// dups undercounts by design rather than holding the socket open for it.
+func (p *Prober) finish(res *probe.Result, rec *metrics.Recorder, rtts []time.Duration, sent, dups int) probe.Result {
 	got := len(rtts)
 	if sent == 0 {
 		res.Err = probe.Fail(probe.ReasonTimeout, "no time left to send a packet")
@@ -315,6 +361,7 @@ func (p *Prober) finish(res *probe.Result, rec *metrics.Recorder, rtts []time.Du
 	rec.Gauge("icmp_packets_sent", float64(sent))
 	rec.Gauge("icmp_packets_received", float64(got))
 	rec.Gauge("icmp_packet_loss_percent", loss)
+	rec.Gauge("icmp_duplicates", float64(dups))
 
 	if got == 0 {
 		res.Err = probe.Fail(probe.ReasonConnect, "no reply to %d packet(s)", sent)

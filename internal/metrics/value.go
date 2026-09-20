@@ -52,6 +52,14 @@ type Counter float64
 
 func (Counter) Kind() Kind { return KindCounter }
 
+// Bool is a condition as a gauge reads it.
+func Bool(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 type Gauge float64
 
 func (Gauge) Kind() Kind { return KindGauge }

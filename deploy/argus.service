@@ -7,7 +7,8 @@ Wants=network-online.target
 Type=simple
 User=argus
 Group=argus
-ExecStart=/usr/local/bin/argus run -config /etc/argus/argus.yaml -probes /etc/argus/probes.d
+# -state holds what the API pushed and wins over the files after a restart.
+ExecStart=/usr/local/bin/argus run -config /etc/argus/argus.yaml -probes /etc/argus/probes.d -state /var/lib/argus/probes.pushed.yaml
 # SIGHUP reloads the checks and reopens log files; nothing restarts.
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
@@ -28,7 +29,8 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictSUIDSGID=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
-ReadWritePaths=/var/log/argus
+StateDirectory=argus
+ReadWritePaths=/var/log/argus /var/lib/argus
 
 # A probe per backend means many short-lived sockets.
 LimitNOFILE=65536

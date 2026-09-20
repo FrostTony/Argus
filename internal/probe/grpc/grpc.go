@@ -25,8 +25,8 @@ import (
 func init() { probe.Register("grpc", New) }
 
 const (
+	maxBody = 1 << 20
 	// maxDrain bounds the read-to-end that trailers require.
-	maxBody  = 1 << 20
 	maxDrain = 8 << 20
 )
 
@@ -77,7 +77,7 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 		res.Err = err
 		return res
 	}
-	authority := cmp.Or(p.cfg.Authority, req.Target.Host, addr)
+	authority := cmp.Or(p.cfg.Authority, req.ServerName(), addr)
 
 	// Recorder is not safe for concurrent writes, and the dial callback runs on a
 	// transport-owned goroutine, so state is recorded after RoundTrip returns.
@@ -135,8 +135,7 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 	if p.cfg.Plaintext {
 		scheme = "http"
 	}
-	httpReq, rerr := p.request(ctx, scheme, authority)
-	err = rerr
+	httpReq, err := p.request(ctx, scheme, authority)
 	if err != nil {
 		res.Err = probe.Fail(probe.ReasonInternal, "%v", err)
 		return res
@@ -146,9 +145,14 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 	resp, err := tr.RoundTrip(httpReq)
 	res.Add("connect", connectD)
 	res.Add("tls", tlsD)
-	tlsinfo.Record(rec, state, time.Now())
+	over, revoked := tlsinfo.Inspect(ctx, rec, state, p.cfg.TLS, time.Now())
+	res.Overhead += over
 	if err != nil {
 		res.Err = probe.Wrap(stageOf(dialErr, tlsErr), err)
+		return res
+	}
+	if revoked != nil {
+		res.Err = probe.Fail(probe.ReasonTLS, "%v", revoked)
 		return res
 	}
 	defer resp.Body.Close()

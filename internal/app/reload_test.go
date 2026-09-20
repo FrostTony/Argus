@@ -123,11 +123,11 @@ probes:
 		t.Fatal(err)
 	}
 	defer a.Close()
-	samples, err := a.Samples(context.Background(), CheckRequest{Probe: "a"})
+	exp, err := a.Samples(context.Background(), CheckRequest{Probe: "a"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range samples {
+	for _, s := range exp.Samples {
 		if s.Name == "probe_up" || s.Name == "probe_success" {
 			if got := s.Labels.Get("country"); got != "ru" {
 				t.Errorf("%s has country=%q, want ru", s.Name, got)

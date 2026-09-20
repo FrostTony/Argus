@@ -23,22 +23,22 @@ Argus does the fan-out in the core: the runner resolves the target, takes every
 address, and probes them one at a time, labelling each series with `backend`.
 
 ```
-argus_probe_up{probe="site",target="https://www.google.com/",backend="142.250.74.46:443",family="ipv4"} 1
-argus_probe_up{probe="site",target="https://www.google.com/",backend="142.250.74.78:443",family="ipv4"} 0
-argus_target_backends{probe="site",target="https://www.google.com/"}     2
-argus_target_backends_up{probe="site",target="https://www.google.com/"}  1
+probe_up{probe="site",target="https://www.google.com/",backend="142.250.74.46:443",family="ipv4"} 1
+probe_up{probe="site",target="https://www.google.com/",backend="142.250.74.78:443",family="ipv4"} 0
+target_backends{probe="site",target="https://www.google.com/"}     2
+target_backends_up{probe="site",target="https://www.google.com/"}  1
 ```
 
 Name resolution is measured as its own step, and an HTTP request is broken into
 the phases that make up its latency:
 
 ```
-argus_resolve_last_duration_seconds                        0.00104
-argus_probe_phase_last_duration_seconds{phase="connect"}   0.00021
-argus_probe_phase_last_duration_seconds{phase="tls"}       0.00208
-argus_probe_phase_last_duration_seconds{phase="write"}     0.00014
-argus_probe_phase_last_duration_seconds{phase="ttfb"}      0.00057
-argus_probe_phase_last_duration_seconds{phase="transfer"}  0.00010
+resolve_last_duration_seconds                        0.00104
+probe_phase_last_duration_seconds{phase="connect"}   0.00021
+probe_phase_last_duration_seconds{phase="tls"}       0.00208
+probe_phase_last_duration_seconds{phase="write"}     0.00014
+probe_phase_last_duration_seconds{phase="ttfb"}      0.00057
+probe_phase_last_duration_seconds{phase="transfer"}  0.00010
 ```
 
 Every timing is exported twice: as a histogram for quantiles, and as a
@@ -83,6 +83,14 @@ http://localhost:6767/metrics  Prometheus exposition
 `-probes` accepts a file or a directory and may be repeated. A directory is the
 usual choice in production (`-probes /etc/argus/probes.d`); a single file is
 easier while writing one check.
+
+`-state <file>` is the other way to run the node: a configuration accepted
+through `PUT /api/config` is written there, and at startup that file wins over
+`-probes`. A node driven by a controller therefore comes back from a restart
+with what it was pushed rather than with whatever is on disk, and a node that
+has never been pushed to starts empty and reports `config_source: none` instead
+of refusing to start. A state file that cannot be parsed is logged and left in
+place, and the node falls back to `-probes`.
 
 Before running a new check as a daemon, run it once:
 
@@ -149,12 +157,14 @@ itself.
 
 | Type | Checks | Notable options |
 |---|---|---|
-| `http` | status, body, headers, JSON fields, redirect chain, certificate | `method`, `headers`, `body`, `auth`, `follow_redirects`, `read_body`, `http2`, `compression`, `validators` |
-| `dns` | answers, rcode, authority and additional sections, drift between resolvers | `servers`, `query_type`, `min_answers`, `expect`, `valid_rcodes`, `require_authoritative`, `compare_servers` |
+| `http` | status, body, headers, JSON fields, redirect chain, certificate | `method`, `headers`, `body`, `auth`, `follow_redirects`, `read_body`, `http2`, `compression`, `proxy_url`, `proxy_from_environment`, `no_proxy`, `validators` |
+| `dns` | answers, rcode, authority and additional sections, drift between resolvers | `servers`, `proto` (`udp`/`tcp`/`tls`/`https`), `query_type`, `min_answers`, `expect`, `valid_rcodes`, `require_authoritative`, `compare_servers` |
 | `tls` | the certificate on the connection, apart from any request | `port`, `min_days_left` |
 | `tcp` | the port, or a scripted conversation over it | `port`, `steps` (`send`/`expect`/`starttls`), `tls` |
+| `unix` | a unix-domain socket, and the conversation over it | `network` (`unix`/`unixgram`/`unixpacket`), `path`, `steps`, `tls`, `read_bytes` |
 | `udp` | a datagram and its reply, or the ICMP refusal from a closed port | `port`, `send`, `expect`, `unreachable_wait` |
-| `icmp` | loss and jitter per address | `packets`, `interval`, `max_loss_percent`, `ttl`, `privileged` |
+| `websocket` | the RFC 6455 upgrade, and optionally a message over the open socket | `path`, `tls`, `subprotocols`, `origin`, `send`+`expect`, `ping` |
+| `icmp` | loss and jitter per address | `packets`, `interval`, `max_loss_percent`, `ttl`, `tos`, `privileged` |
 | `grpc` | the health service, spoken directly over HTTP/2 | `port`, `service`, `plaintext`, `authority` |
 | `domain` | the registration behind the domain over RDAP: expiry, registrar, EPP status | `min_days`, `require_status`, `forbid_status` |
 | `external` | anything that exits 0 and prints `name value` lines | `command`, `args`, `env`, `mode`, `metric_prefix` |
@@ -164,10 +174,22 @@ A `validators:` list replaces the default "2xx is fine" with named assertions,
 and each one that fails names itself in the failure message.
 
 Options that apply to any type: `interval`, `timeout`, `labels`, `ip_version`,
-`source_ip`, `requests_per_probe`, `negative_test` (success means being
-refused), `run_on` (a regular expression over the node name, so one file can be
-deployed fleet-wide), and `schedule` — time windows with a timezone, for checks
-that should not page anyone at 04:00.
+`source_ip`, `hostname` (the name presented to the target — Host header and SNI
+— when it differs from the target's own), `requests_per_probe`, `negative_test`
+(success means being refused), `run_on` (a regular expression over the node
+name, so one file can be deployed fleet-wide), and `schedule` — time windows
+with a timezone, for checks that should not page anyone at 04:00.
+
+Any probe that speaks TLS takes `check_revoked: true` in its `tls_config`: an
+expiry date says nothing about a key that leaked last week. The answer comes
+from the stapled OCSP response when the server sends one, and from the
+responder named in the certificate otherwise. A responder that cannot be
+reached, or one whose answer is past its `nextUpdate`, is reported and not
+failed — otherwise every service would depend on a third party's uptime, and a
+replayed "good" would read as one. A revocation is not undone by the answer
+being old. Responder answers are cached for an hour or until they go stale,
+whichever is sooner, and the time spent asking is left out of
+`probe_duration_seconds`: the responder is not the target.
 
 [examples/probes.d/example.yaml](examples/probes.d/example.yaml) is a working
 file with every option demonstrated and commented.
@@ -190,10 +212,15 @@ source are merged into the target's own.
 
 ## Metrics
 
-Names carry the node's prefix (`argus_` by default) and the node's labels, so a
-node's series never collide with another's. Every series is labelled with
-`probe`, `probe_type` and `target`; a series that belongs to one address also
-carries `backend` and `family`.
+Probe series carry no prefix, so `probe_success`, `probe_duration_seconds` and
+`probe_up` are the names blackbox_exporter dashboards and alerting rules already
+use. `surfacers[].prometheus.prefix` adds one back when several nodes write into
+one store through remote-write and their series must not meet. The node's own
+counters are `argus_*` whatever that prefix is: the prefix namespaces what the
+node measures, and the node is not one of its own targets.
+
+Every series is labelled with `probe`, `probe_type` and `target`; a series that
+belongs to one address also carries `backend` and `family`.
 
 ### Every probe
 
@@ -207,6 +234,8 @@ carries `backend` and `family`.
 | `probe_last_duration_seconds` | the latest run's latency | the same measurement as a gauge |
 | `probe_phase_duration_seconds{phase}` | latency split by phase, as a histogram | `connect`, `tls`, `write`, `ttfb`, `transfer`, from the connection trace |
 | `probe_phase_last_duration_seconds{phase}` | the latest phase timings | the same as a gauge |
+| `probe_timeout_seconds` | the deadline one request runs under | the probe's effective `timeout`, so a latency graph shows its ceiling |
+| `probe_expect_info{…}` | what a pattern matched | one label per **named** capture group in an `expect`, `body_regex`, `header_regex` or `answer_regex`; no named groups, no series. A group named after an identity label (`target`, `backend`, `probe`, …) is dropped: the value is the server's text |
 | `target_backends` | addresses the target resolved to | count of the answer, capped by `resolver.max_backends` |
 | `target_backends_up` | how many of them answered | count of backends whose run passed |
 | `target_backend_info{val}` | which addresses those are | one series per address, the address in `val` |
@@ -246,11 +275,15 @@ and by a `tcp` probe that upgrades with `starttls`.
 |---|---|---|
 | `tls_cert_expiry_days` | life left in the leaf certificate | `notAfter` minus now, in days; negative once expired |
 | `tls_chain_expiry_days` | life left in the weakest link | the same for the first certificate in the chain to expire, so an expiring intermediate is visible |
+| `tls_chain_not_after_seconds` | when that link expires | the same date as a unix timestamp |
 | `tls_cert_valid` | whether it is usable right now | 1 when the chain verifies against the configured name and the clock |
 | `tls_cert_not_after_seconds`, `tls_cert_not_before_seconds` | the validity window | the certificate's own timestamps |
 | `tls_chain_length` | certificates the server sent | length of the presented chain |
 | `tls_cert_san_count` | names the certificate covers | number of SAN entries |
 | `tls_ocsp_stapled` | whether revocation came with the handshake | 1 when the server stapled a response |
+| `tls_cert_revoked` | whether the certificate still stands | with `check_revoked: true`, 1 when the responder says it was revoked — and the check fails |
+| `tls_ocsp_status_info{val}` | what the responder said | `good`, `revoked`, `unknown`, or `unavailable` when it could not be asked |
+| `tls_ocsp_next_update_seconds` | how current that answer is | the responder's `nextUpdate`, as a unix timestamp |
 | `tls_handshake_resumed` | whether the session was resumed | 1 on a resumed handshake |
 | `tls_cert_fingerprint_info{val}` | the exact certificate | SHA-256 of the leaf, so a change is a diff rather than a guess |
 | `tls_cert_serial_info{val}`, `tls_cert_issuer_info{val}`, `tls_cert_subject_info{val}` | who issued it and to whom | fields of the leaf, as labels |
@@ -260,7 +293,12 @@ and by a `tcp` probe that upgrades with `starttls`.
 ### `dns`
 
 Every resolver in `servers:` is queried separately and labelled `resolver`;
-`qtype` carries the record type.
+`qtype` carries the record type. `proto:` picks the pipe — `udp` (the default),
+`tcp`, `tls` for DNS over TLS on :853, or `https` for DNS over HTTPS, where
+`servers:` are `https://` endpoints. A resolver behind DoT checked over :53/udp
+is a check of a path nobody uses; over TLS the resolver's own certificate is
+reported through the `tls_*` series. The round trip is split into the
+`connect` and `query` phases.
 
 | Metric | Shows | How |
 |---|---|---|
@@ -284,6 +322,7 @@ Every resolver in `servers:` is queried separately and labelled `resolver`;
 | `icmp_rtt_min_seconds`, `icmp_rtt_max_seconds`, `icmp_rtt_avg_seconds` | round-trip spread | smallest, largest and mean over the replies received |
 | `icmp_rtt_jitter_seconds` | how unsteady the path is | mean absolute deviation from the average RTT |
 | `icmp_reply_hop_limit` | hops on the return path | the TTL the reply arrived with |
+| `icmp_duplicates` | replies to a packet already answered | +1 per duplicate, which a broadcast address or an anycast set produces |
 
 ### `domain`
 
@@ -298,12 +337,16 @@ Registration data over RDAP, answered by the registry rather than the host.
 | `domain_registrar_info{val}`, `domain_status_info{val}` | who holds it and in what state | registrar name and the EPP status codes, as labels |
 | `domain_lookup_duration_seconds` | how long the registry took | measured around the RDAP request |
 
-### `tcp`, `udp`, `grpc`, `external`
+### `tcp`, `unix`, `udp`, `websocket`, `grpc`, `external`
 
 | Metric | Shows | How |
 |---|---|---|
 | `tcp_response_size_bytes` | bytes read during the conversation | sum over the `steps:` that read |
+| `unix_response_size_bytes` | bytes read over the socket | the same, for a `unix` probe |
 | `udp_response_size_bytes` | size of the reply datagram | bytes received, 0 when the probe waited for an ICMP refusal instead |
+| `websocket_handshake_status_code` | how the upgrade was answered | 101 is the only success; a proxy that forwards HTTP and drops `Upgrade` answers 200 |
+| `websocket_subprotocol_info{val}` | the subprotocol the server chose | the `Sec-WebSocket-Protocol` it echoed back |
+| `websocket_response_size_bytes` | size of the message that came back | bytes in the frame, with `send`/`expect` |
 | `grpc_serving_status` | the health service's verdict | the `ServingStatus` enum: 1 is `SERVING` |
 | `grpc_status_info{val}` | the gRPC status code | the `grpc-status` trailer |
 | `external_exit_code` | how the command ended | the process exit status |
@@ -315,13 +358,18 @@ can report whatever it measures.
 
 ### The node itself
 
-`build_info{val}`, `uptime_seconds`, `goroutines`, `memory_bytes`, `series`,
-`series_dropped`, `probes_configured`, `probe_targets`, `probe_slots_used`,
-`probe_slots_total`, `config_reloads`, `config_reload_failures`,
-`discovery_failures`, `discovery_age_seconds`.
+Always under `argus_`, whatever the exposition prefix is: these belong to the
+agent rather than to anything it checks.
+
+`argus_build_info{val}`, `argus_uptime_seconds`, `argus_goroutines`,
+`argus_memory_bytes`, `argus_series`, `argus_series_dropped`,
+`argus_probes_configured`, `argus_probe_targets`, `argus_probe_slots_used`,
+`argus_probe_slots_total`, `argus_config_reloads`,
+`argus_config_reload_failures`, `argus_discovery_failures`,
+`argus_discovery_age_seconds`.
 
 Cardinality is bounded on purpose. `max_series` caps the store; samples beyond
-it are refused and counted in `series_dropped`. Series for a target that
+it are refused and counted in `argus_series_dropped`. Series for a target that
 disappears stop being written and are retired after `stale_after`.
 
 ### Sinks
@@ -340,14 +388,27 @@ disappears stop being written and are retired after `stale_after`.
 |---|---|---|
 | `GET /metrics` | none | Prometheus exposition |
 | `GET /`, `GET /status` | none | status page |
-| `GET /status.json`, `GET /status/data` | none | the same state as JSON |
+| `GET /status.json`, `GET /status/data` | none | the same state as JSON, plus `version`, `config_source` and `config_hash` |
 | `GET /healthz` | none | liveness |
 | `GET /api/config` | read | the current check configuration as YAML |
-| `PUT\|POST /api/config` | write | replace it, and write it back to disk |
+| `PUT\|POST /api/config` | write | replace it, and write it back to disk (`-state`, or the single `-probes` file) |
 | `POST /api/reload` | write | re-read the files |
 | `POST /api/probes` | write | run a probe now, off its schedule (`?name=` for one) |
 | `GET\|POST /api/check` | read / write | run a check once and return the result as JSON |
 | `GET /probe?probe=X&target=Y` | read / write | run a check once and return it as a Prometheus exposition |
+
+`/probe` also takes `module=` as a synonym for `probe=` (blackbox's name for the
+same thing), `hostname=` to change the Host header and SNI without changing the
+address, and `debug=true` to prepend the run's trace as comment lines — the
+scrape stays a valid exposition, and whoever is holding curl gets the log.
+`target=`, `hostname=` and `debug=` each make the request a write: the first two
+send the probe's credentials somewhere the configuration did not, and the third
+returns what the target answered.
+
+`/probe` carries no histograms. One run is not a distribution — a histogram
+scraped there has a count of one and never moves, so `rate()` over it reads as
+nothing happening. The `*_last_duration_seconds` gauge beside it is the
+measurement, and it is what `probe_duration_seconds` is aliased from.
 
 The `/api/*` paths exist only when `http.api.enabled` is set. Authentication is
 a bearer token, compared in constant time, with a separate read-only token if
@@ -358,7 +419,8 @@ the configuration did not say to send them.
 **A write token is equivalent to shell access on the node**: a probe definition
 of type `external` runs a command. Treat it accordingly.
 
-`/probe` lets a scrape name the target instead of the configuration:
+`/probe` lets a scrape name the target instead of the configuration, and answers
+in the scrape rather than on the next one — a drop-in for blackbox_exporter:
 
 ```yaml
   - job_name: argus
@@ -371,6 +433,18 @@ of type `external` runs a command. Treat it accordingly.
       - {source_labels: [__address__], target_label: target}
       - {target_label: __address__, replacement: "argus-node:6767"}
 ```
+
+Alongside its own names, `/probe` publishes blackbox_exporter's for the series
+both measure the same way — `probe_duration_seconds`, `probe_http_status_code`,
+`probe_http_version`, `probe_http_duration_seconds{phase}`, `probe_http_ssl`,
+`probe_ssl_earliest_cert_expiry`, `probe_dns_lookup_time_seconds`,
+`probe_dns_answer_rrs`, `probe_ip_protocol`, `probe_tls_version_info{version}`,
+`probe_icmp_duration_seconds{phase}` and `probe_failed_due_to_regex` — so a
+dashboard written for blackbox works unchanged. Only exact twins are
+translated: a familiar name over a different measurement is worse than no
+series at all. The aliases never take the node's prefix, since whatever reads
+them was written against blackbox. `http.api.probe_aliases: false` turns them
+off; `/metrics` never carries them.
 
 ## Reloading
 
@@ -391,6 +465,12 @@ the API refuses the write instead of guessing which file to edit.
 [deploy/logrotate.conf](deploy/logrotate.conf) covers the file sink. The
 [Dockerfile](Dockerfile) builds a static binary into a minimal image running as
 an unprivileged user.
+
+[deploy/grafana/argus-checks.json](deploy/grafana/argus-checks.json) is a
+dashboard for everything above: the state of every target and of each address
+behind it, latency split by phase, and a row per probe type. The data source
+and the metric prefix are variables, so it imports as it is —
+[deploy/grafana/README.md](deploy/grafana/README.md) has the details.
 
 [docs/swagger.yaml](docs/swagger.yaml) is the full OpenAPI description of the
 HTTP surface.

@@ -17,6 +17,7 @@ import (
 	"github.com/tonyamdfrost-cmd/Argus/internal/config"
 	"github.com/tonyamdfrost-cmd/Argus/internal/metrics"
 	"github.com/tonyamdfrost-cmd/Argus/internal/probe"
+	"github.com/tonyamdfrost-cmd/Argus/internal/probe/tlsinfo"
 )
 
 func init() { probe.Register("dns", New) }
@@ -31,10 +32,14 @@ type Config struct {
 	// Servers to query; empty means the system resolvers.
 	Servers []string `yaml:"servers"`
 	// QueryName is what to ask for; empty means the target's own name.
-	QueryName  string `yaml:"query_name"`
-	QueryType  string `yaml:"query_type"`
-	Proto      string `yaml:"proto"` // udp | tcp
-	MinAnswers int    `yaml:"min_answers"`
+	QueryName string `yaml:"query_name"`
+	QueryType string `yaml:"query_type"`
+	// Proto is udp, tcp, tls (DoT) or https (DoH); dot and doh are accepted too.
+	Proto string `yaml:"proto"`
+	// TLSOptions verifies the resolver, for the two protocols that present a
+	// certificate.
+	TLSOptions tlsinfo.Options `yaml:"tls_config"`
+	MinAnswers int             `yaml:"min_answers"`
 	// Expect is the answer set, order-insensitive.
 	Expect []string `yaml:"expect"`
 	// ValidRcodes accepts rcodes other than NOERROR, such as an expected NXDOMAIN.
@@ -55,8 +60,9 @@ type Config struct {
 
 type Prober struct {
 	cfg         Config
+	transport   *transport
 	qtype       uint16
-	qname       string
+	qtypeName   string
 	servers     []string
 	expect      map[string]bool
 	rcodes      map[string]bool
@@ -84,15 +90,28 @@ func New(pc config.Probe) (probe.Prober, error) {
 	if !ok {
 		return nil, fmt.Errorf("dns.query_type: unknown record type %q", cfg.QueryType)
 	}
-	if cfg.Proto != "udp" && cfg.Proto != "tcp" {
-		return nil, fmt.Errorf("dns.proto: want udp|tcp, got %q", cfg.Proto)
+	proto, ok := protoAliases[strings.ToLower(strings.TrimSpace(cfg.Proto))]
+	if !ok {
+		return nil, fmt.Errorf("dns.proto: want udp|tcp|tls|https, got %q", cfg.Proto)
+	}
+	cfg.Proto = proto
+	tr, err := newTransport(proto, cfg.TLSOptions)
+	if err != nil {
+		return nil, err
 	}
 
 	servers := make([]string, 0, len(cfg.Servers))
 	for _, s := range cfg.Servers {
-		servers = append(servers, withPort(s))
+		normalized, err := tr.server(s)
+		if err != nil {
+			return nil, err
+		}
+		servers = append(servers, normalized)
 	}
 	if len(servers) == 0 {
+		if proto == protoHTTPS {
+			return nil, fmt.Errorf("dns.servers: DNS over HTTPS has no system default; name the endpoint")
+		}
 		sysServers, err := systemServers()
 		if err != nil {
 			return nil, err
@@ -118,18 +137,18 @@ func New(pc config.Probe) (probe.Prober, error) {
 	}
 
 	p := &Prober{
-		cfg:     cfg,
-		qtype:   qtype,
-		qname:   strings.ToUpper(cfg.QueryType),
-		servers: servers,
-		expect:  expect,
-		rcodes:  rcodes,
+		cfg:       cfg,
+		transport: tr,
+		qtype:     qtype,
+		qtypeName: strings.ToUpper(cfg.QueryType),
+		servers:   servers,
+		expect:    expect,
+		rcodes:    rcodes,
 	}
-	var err error
-	if p.answerRe, err = compileRe(cfg.AnswerRegex); err != nil {
+	if p.answerRe, err = probe.Pattern(cfg.AnswerRegex); err != nil {
 		return nil, fmt.Errorf("dns.answer_regex: %w", err)
 	}
-	if p.answerNotRe, err = compileRe(cfg.AnswerNotRegex); err != nil {
+	if p.answerNotRe, err = probe.Pattern(cfg.AnswerNotRegex); err != nil {
 		return nil, fmt.Errorf("dns.answer_not_regex: %w", err)
 	}
 	for _, sec := range []section{
@@ -138,22 +157,15 @@ func New(pc config.Probe) (probe.Prober, error) {
 		{name: "additional", of: func(a *answer) []string { return a.Additional },
 			reSrc: cfg.AdditionalRegex, notSrc: cfg.AdditionalNotRegex},
 	} {
-		if sec.re, err = compileRe(sec.reSrc); err != nil {
+		if sec.re, err = probe.Pattern(sec.reSrc); err != nil {
 			return nil, fmt.Errorf("dns.%s_regex: %w", sec.name, err)
 		}
-		if sec.notRe, err = compileRe(sec.notSrc); err != nil {
+		if sec.notRe, err = probe.Pattern(sec.notSrc); err != nil {
 			return nil, fmt.Errorf("dns.%s_not_regex: %w", sec.name, err)
 		}
 		p.sections = append(p.sections, sec)
 	}
 	return p, nil
-}
-
-func compileRe(s string) (*regexp.Regexp, error) {
-	if s == "" {
-		return nil, nil
-	}
-	return regexp.Compile(s)
 }
 
 // SelfAddressed reports that the runner must not resolve the target; it is the question.
@@ -170,24 +182,30 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 	answersBy := make(map[string][]string, len(p.servers))
 	replies := make(map[string]*answer, len(p.servers))
 	var failures int
+	// Kept so that a run where nobody answered can say why rather than only
+	// how many. A classified failure (a revoked resolver certificate, say)
+	// keeps its own reason through Wrap.
+	var lastErr error
 
 	for i, server := range p.servers {
-		r := rec.With("resolver", server, "qtype", p.qname)
-		a, err := p.query(ctx, req, name, server, len(p.servers)-i)
+		r := rec.With("resolver", server, "qtype", p.qtypeName)
+		a, err := p.query(ctx, req, r, name, server, len(p.servers)-i)
 
 		r.Count("dns_queries_total", 1)
 		r.Info("dns_rcode_info", a.Rcode)
 		if err != nil {
 			r.Count("dns_query_failures_total", 1)
 			failures++
+			lastErr = err
 			continue
 		}
 		// Timed only when there was an answer, so a dead resolver adds no latency.
 		r.Duration(tDNS, req.Buckets, a.RTT)
+		a.Timing.apply(&res)
 		r.Gauge("dns_answers", float64(len(a.Records)))
 		r.Gauge("dns_authority_rrs", float64(len(a.Authority)))
 		r.Gauge("dns_additional_rrs", float64(len(a.Additional)))
-		r.Gauge("dns_authoritative", boolValue(a.Authoritative))
+		r.Gauge("dns_authoritative", metrics.Bool(a.Authoritative))
 		if a.Serial > 0 {
 			r.Gauge("dns_soa_serial", float64(a.Serial))
 		}
@@ -201,7 +219,8 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 	}
 
 	if len(answersBy) == 0 {
-		res.Err = probe.Fail(probe.ReasonDNS, "none of %d resolver(s) answered", len(p.servers))
+		res.Err = probe.Wrap(probe.ReasonDNS,
+			fmt.Errorf("none of %d resolver(s) answered: %w", len(p.servers), lastErr))
 		return res
 	}
 	rec.Gauge("dns_resolvers_failed", float64(failures))
@@ -215,7 +234,7 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 			return res
 		}
 		consistent := allEqual(answersBy)
-		rec.Gauge("dns_consistent", boolValue(consistent))
+		rec.Gauge("dns_consistent", metrics.Bool(consistent))
 		if !consistent {
 			res.Err = probe.Fail(probe.ReasonContent, "resolvers disagree: %s", describe(answersBy))
 			return res
@@ -250,7 +269,7 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 				return res
 			}
 		}
-		if err := p.matchAnswers(server, answers); err != nil {
+		if err := p.matchAnswers(rec, server, answers); err != nil {
 			res.Err = err
 			return res
 		}
@@ -263,7 +282,7 @@ func (s section) match(server string, a *answer) error {
 	if s.notRe != nil {
 		for _, r := range records {
 			if s.notRe.MatchString(r) {
-				return probe.Fail(probe.ReasonContent,
+				return probe.FailRegex(
 					"%s: %s section record %q matches the forbidden %q", server, s.name, r, s.notSrc)
 			}
 		}
@@ -276,25 +295,33 @@ func (s section) match(server string, a *answer) error {
 			return nil
 		}
 	}
-	return probe.Fail(probe.ReasonContent,
+	return probe.FailRegex(
 		"%s: nothing in the %s section matches %q", server, s.name, s.reSrc)
 }
 
-func (p *Prober) matchAnswers(server string, answers []string) error {
+func (p *Prober) matchAnswers(rec *metrics.Recorder, server string, answers []string) error {
 	for _, a := range answers {
 		if p.answerNotRe != nil && p.answerNotRe.MatchString(a) {
-			return probe.Fail(probe.ReasonContent, "%s: answer %q matches the forbidden %q", server, a, p.cfg.AnswerNotRegex)
+			return probe.FailRegex("%s: answer %q matches the forbidden %q", server, a, p.cfg.AnswerNotRegex)
 		}
 	}
 	if p.answerRe == nil {
 		return nil
 	}
+	named := probe.Named(p.answerRe)
 	for _, a := range answers {
-		if p.answerRe.MatchString(a) {
+		if !named {
+			if p.answerRe.MatchString(a) {
+				return nil
+			}
+			continue
+		}
+		if m := p.answerRe.FindStringSubmatch(a); m != nil {
+			probe.ExpectInfo(rec, p.answerRe, m, "server", server)
 			return nil
 		}
 	}
-	return probe.Fail(probe.ReasonContent, "%s: no answer matches %q", server, p.cfg.AnswerRegex)
+	return probe.FailRegex("%s: no answer matches %q", server, p.cfg.AnswerRegex)
 }
 
 func (p *Prober) missing(answers []string) string {
@@ -321,41 +348,45 @@ type answer struct {
 	Rcode      string
 	TTL        time.Duration
 	RTT        time.Duration
+	// Timing splits the round trip into connecting and answering.
+	Timing timing
 	// Authoritative is the AA flag: the zone answered, not a cache.
 	Authoritative bool
 	Serial        uint32
 }
 
 // query asks one resolver one question and normalises the reply.
-func (p *Prober) query(ctx context.Context, req probe.Request, name, server string, serversLeft int) (*answer, error) {
+func (p *Prober) query(ctx context.Context, req probe.Request, rec *metrics.Recorder, name, server string, serversLeft int) (*answer, error) {
 	ctx, cancel := share(ctx, serversLeft)
 	defer cancel()
-	client := p.clientFor(ctx, req)
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(name), p.qtype)
 	m.RecursionDesired = p.cfg.Recursion == nil || *p.cfg.Recursion
-	if p.cfg.Proto == "udp" {
+	if p.cfg.Proto == protoUDP {
 		m.SetEdns0(edns0Size, false)
 	}
 
-	resp, rtt, err := client.ExchangeContext(ctx, m, server)
+	resp, span, err := p.transport.exchange(ctx, req, m, server, rec)
 	if err != nil {
-		return &answer{Rcode: "ERROR", RTT: rtt}, err
+		return &answer{Rcode: "ERROR", RTT: span.total(), Timing: span}, err
 	}
-	if resp.Truncated && p.cfg.Proto == "udp" {
+	if resp.Truncated && p.cfg.Proto == protoUDP {
 		// A truncated answer is half a zone: retry over TCP.
-		tcp := &dns.Client{Net: "tcp", Timeout: client.Timeout, Dialer: req.Dialer("tcp")}
-		full, tcpRTT, tcpErr := tcp.ExchangeContext(ctx, m, server)
+		over := &transport{proto: protoTCP}
+		full, tcpSpan, tcpErr := over.exchange(ctx, req, m, server, rec)
+		span.connect += tcpSpan.connect
+		span.query += tcpSpan.query
 		if tcpErr != nil {
-			return &answer{Rcode: "ERROR", RTT: rtt + tcpRTT},
+			return &answer{Rcode: "ERROR", RTT: span.total(), Timing: span},
 				fmt.Errorf("%s: truncated over UDP and TCP failed: %w", server, tcpErr)
 		}
-		resp, rtt = full, rtt+tcpRTT
+		resp = full
 	}
 
 	out := &answer{
 		Rcode:         dns.RcodeToString[resp.Rcode],
-		RTT:           rtt,
+		RTT:           span.total(),
+		Timing:        span,
 		Authoritative: resp.Authoritative,
 		Authority:     records(resp.Ns),
 		Additional:    records(resp.Extra),
@@ -386,16 +417,6 @@ func share(ctx context.Context, serversLeft int) (context.Context, context.Cance
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, time.Until(deadline)/time.Duration(max(1, serversLeft)))
-}
-
-// clientFor is the client for one query: bound to the probe's source address and
-// advertising EDNS0, so a large zone does not come back truncated at 512 bytes.
-func (p *Prober) clientFor(ctx context.Context, req probe.Request) *dns.Client {
-	c := &dns.Client{Net: p.cfg.Proto, UDPSize: edns0Size, Dialer: req.Dialer(p.cfg.Proto)}
-	if deadline, ok := ctx.Deadline(); ok {
-		c.Timeout = max(time.Until(deadline), time.Millisecond)
-	}
-	return c
 }
 
 func records(rrs []dns.RR) []string {
@@ -463,13 +484,6 @@ func describe(m map[string][]string) string {
 	return strings.Join(parts, " ")
 }
 
-func withPort(addr string) string {
-	if _, _, err := net.SplitHostPort(addr); err == nil {
-		return addr
-	}
-	return net.JoinHostPort(addr, "53")
-}
-
 // systemServers reads the resolvers from /etc/resolv.conf.
 func systemServers() ([]string, error) {
 	cfg, err := dns.ClientConfigFromFile("/etc/resolv.conf")
@@ -481,11 +495,4 @@ func systemServers() ([]string, error) {
 		out = append(out, net.JoinHostPort(s, cfg.Port))
 	}
 	return out, nil
-}
-
-func boolValue(b bool) float64 {
-	if b {
-		return 1
-	}
-	return 0
 }

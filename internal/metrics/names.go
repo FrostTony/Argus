@@ -26,6 +26,20 @@ func ValidLabelName(s string) bool {
 	return validName(s, false) && !strings.HasPrefix(s, "__")
 }
 
+// SelfPrefix marks the agent's own series. They are named in full rather than
+// namespaced by the exposition prefix: that prefix is for what the node
+// measures, and the node is not one of its own targets.
+const SelfPrefix = "argus_"
+
+// Prefixed is a series name under the exposition's prefix. A name that is
+// already absolute keeps its own.
+func Prefixed(prefix, name string) string {
+	if prefix == "" || strings.HasPrefix(name, SelfPrefix) {
+		return name
+	}
+	return prefix + name
+}
+
 func validName(s string, allowColon bool) bool {
 	if s == "" {
 		return false

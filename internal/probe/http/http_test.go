@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -374,5 +375,120 @@ func TestSNIFollowsEachHop(t *testing.T) {
 	// The second hop is addressed by IP, and an IP is never sent as SNI.
 	if names[1] != "" {
 		t.Errorf("second hop sent SNI %q, want none for an address", names[1])
+	}
+}
+
+// options builds a prober and returns the error instead of failing the test.
+func options(s string) (*Prober, error) {
+	var node yaml.Node
+	if err := yaml.Unmarshal([]byte(s), &node); err != nil {
+		return nil, err
+	}
+	pc := config.Probe{Name: "test", Type: "http"}
+	if len(node.Content) > 0 {
+		pc.Options = *node.Content[0]
+	}
+	p, err := New(pc)
+	if err != nil {
+		return nil, err
+	}
+	return p.(*Prober), nil
+}
+
+// no_proxy is the exception beside the rule: a proxy for the outside world is
+// not a proxy for a neighbour.
+func TestNoProxyExcludesHosts(t *testing.T) {
+	p, err := options("proxy_url: http://proxy.local:3128\nno_proxy: internal.test,10.0.0.0/8\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		url    string
+		proxid bool
+	}{
+		{"https://example.com/", true},
+		{"https://internal.test/", false},
+		{"http://10.1.2.3/", false},
+	} {
+		u, _ := url.Parse(tc.url)
+		got, err := p.proxy(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (got != nil) != tc.proxid {
+			t.Errorf("%s: proxy = %v, want proxied=%v", tc.url, got, tc.proxid)
+		}
+	}
+}
+
+func TestNoProxyNeedsAProxy(t *testing.T) {
+	if _, err := options("no_proxy: internal.test\n"); err == nil {
+		t.Error("no_proxy without a proxy was accepted; it excludes nothing")
+	}
+	if _, err := options("proxy_url: http://p:3128\nproxy_from_environment: true\n"); err == nil {
+		t.Error("two sources of proxy configuration were accepted")
+	}
+}
+
+// A probe that names its proxy is describing the path under test; the
+// environment's habit of sending loopback direct would quietly leave it.
+func TestProxyURLAloneProxiesEverything(t *testing.T) {
+	p, err := options("proxy_url: http://proxy.local:3128\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []string{"https://example.com/", "http://127.0.0.1:8080/", "http://localhost/"} {
+		u, _ := url.Parse(target)
+		got, err := p.proxy(u)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got == nil {
+			t.Errorf("%s went direct, though a proxy was named", target)
+		}
+	}
+}
+
+func TestProxyHeadersNeedAProxy(t *testing.T) {
+	if _, err := options("proxy_headers: {X-Token: abc}\n"); err == nil {
+		t.Error("proxy_headers without a proxy was accepted; there is nothing to send them to")
+	}
+}
+
+// hostname pins the name presented to one host; following a redirect elsewhere
+// would offer it to a host it does not belong to.
+func TestHostnameStopsAtAForeignRedirect(t *testing.T) {
+	var same bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/here":
+			w.WriteHeader(http.StatusOK)
+		case same:
+			http.Redirect(w, r, "/here", http.StatusFound)
+		default:
+			http.Redirect(w, r, "http://other.invalid/", http.StatusFound)
+		}
+	}))
+	defer srv.Close()
+
+	p := newProber(t, "follow_redirects: true\nmax_redirects: 5\n")
+	req := request(t, srv)
+	req.Hostname = "canary.example.com"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	res := p.Probe(ctx, req, metrics.NewRecorder(nil))
+	if res.Err == nil {
+		t.Fatal("a redirect to another host was followed with the pinned name")
+	}
+	// Refused before the dial, so it is our reason and not a resolution error.
+	if !strings.Contains(res.Err.Error(), "another host is another service") {
+		t.Errorf("the redirect failed for the wrong reason: %v", res.Err)
+	}
+
+	same = true
+	if res := p.Probe(ctx, req, metrics.NewRecorder(nil)); res.Err != nil {
+		t.Errorf("a redirect on the same host was refused: %v", res.Err)
 	}
 }

@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/net/idna"
 
 	"github.com/tonyamdfrost-cmd/Argus/internal/config"
@@ -43,6 +44,13 @@ type Config struct {
 	Auth         *Auth             `yaml:"auth"`
 	ProxyURL     string            `yaml:"proxy_url"`
 	ProxyHeaders map[string]string `yaml:"proxy_headers"`
+	// ProxyFromEnvironment takes the proxy from HTTP_PROXY/HTTPS_PROXY/NO_PROXY,
+	// as every other HTTP client on the host does.
+	ProxyFromEnvironment bool `yaml:"proxy_from_environment"`
+	// NoProxy lists hosts, domains and CIDRs to reach directly. It applies to
+	// proxy_url too: a proxy for the outside world is not a proxy for a
+	// neighbour, and the exception belongs beside the rule.
+	NoProxy string `yaml:"no_proxy"`
 
 	FollowRedirects *bool `yaml:"follow_redirects"`
 	MaxRedirects    int   `yaml:"max_redirects"`
@@ -73,7 +81,7 @@ type Prober struct {
 	sizeLimit  int64
 	tlsConfig  *tls.Config
 	validators []Validator
-	proxy      *url.URL
+	proxy      func(*url.URL) (*url.URL, error)
 	body       []byte
 }
 
@@ -119,12 +127,40 @@ func New(pc config.Probe) (probe.Prober, error) {
 			return nil, err
 		}
 	}
-	if cfg.ProxyURL != "" {
+	if cfg.ProxyURL != "" && cfg.ProxyFromEnvironment {
+		return nil, fmt.Errorf("http: set proxy_url or proxy_from_environment, not both")
+	}
+	switch {
+	case cfg.ProxyURL != "" && cfg.NoProxy == "":
+		// Named without exceptions, the proxy is used for everything. The
+		// environment's rules are deliberately not consulted here: a probe that
+		// names its proxy is describing the path under test, and
+		// httpproxy's built-in loopback bypass would quietly leave that path.
 		u, err := url.Parse(cfg.ProxyURL)
 		if err != nil {
 			return nil, fmt.Errorf("http.proxy_url: %w", err)
 		}
-		p.proxy = u
+		p.proxy = func(*url.URL) (*url.URL, error) { return u, nil }
+	case cfg.ProxyURL != "":
+		if _, err := url.Parse(cfg.ProxyURL); err != nil {
+			return nil, fmt.Errorf("http.proxy_url: %w", err)
+		}
+		// One proxy for both schemes: proxy_url names the proxy, not a rule.
+		// With exceptions, the matching is httpproxy's, which also sends
+		// localhost and loopback addresses direct.
+		p.proxy = (&httpproxy.Config{
+			HTTPProxy: cfg.ProxyURL, HTTPSProxy: cfg.ProxyURL, NoProxy: cfg.NoProxy,
+		}).ProxyFunc()
+	case cfg.ProxyFromEnvironment:
+		env := httpproxy.FromEnvironment()
+		if cfg.NoProxy != "" {
+			env.NoProxy = cfg.NoProxy
+		}
+		p.proxy = env.ProxyFunc()
+	case cfg.NoProxy != "":
+		return nil, fmt.Errorf("http.no_proxy: nothing to exclude from; set proxy_url or proxy_from_environment")
+	case len(cfg.ProxyHeaders) > 0:
+		return nil, fmt.Errorf("http.proxy_headers: nothing to send them to; set proxy_url or proxy_from_environment")
 	}
 	if cfg.Body != "" && cfg.BodyFile != "" {
 		return nil, fmt.Errorf("http: set body or body_file, not both")
@@ -167,6 +203,12 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 		return res
 	}
 
+	// The name presented, when it is not the one in the URL: Host and SNI move
+	// together, or the server answers one virtual host and certifies another.
+	if req.Hostname != "" {
+		httpReq.Host = req.Hostname
+	}
+
 	client, conns := p.client(req, u)
 	// An HTTP/2 stream aborted by the deadline leaves a connection that is not idle.
 	defer conns.closeAll()
@@ -191,12 +233,19 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 	done := time.Now()
 	p.phases(&res, t, done)
 	p.recordResponse(rec, resp, size, t.wasReused())
+	var revoked error
 	if resp.TLS != nil {
-		tlsinfo.Record(rec, resp.TLS, done)
+		var over time.Duration
+		over, revoked = tlsinfo.Inspect(ctx, rec, resp.TLS, p.cfg.TLS, done)
+		res.Overhead += over
 	}
 
 	if readErr != nil {
 		res.Err = probe.Wrap(probe.ReasonContent, readErr)
+		return res
+	}
+	if revoked != nil {
+		res.Err = probe.Fail(probe.ReasonTLS, "%v", revoked)
 		return res
 	}
 	res.Err = p.validate(rec, resp, body, size, done)
@@ -219,8 +268,12 @@ func (p *Prober) client(req probe.Request, u *url.URL) (*http.Client, *connSet) 
 	origin := asciiHost(u.Hostname())
 	dialer := req.Dialer("tcp")
 	conns := &connSet{}
+	tlsCfg := p.tlsConfig.Clone()
+	if tlsCfg.ServerName == "" && req.Hostname != "" {
+		tlsCfg.ServerName = req.Hostname
+	}
 	tr := &http.Transport{
-		TLSClientConfig:    p.tlsConfig.Clone(),
+		TLSClientConfig:    tlsCfg,
 		DisableKeepAlives:  !p.cfg.KeepAlive,
 		DisableCompression: !p.cfg.Compression,
 		ForceAttemptHTTP2:  p.cfg.HTTP2 == nil || *p.cfg.HTTP2,
@@ -233,11 +286,10 @@ func (p *Prober) client(req probe.Request, u *url.URL) (*http.Client, *connSet) 
 		},
 	}
 	if p.proxy != nil {
-		// A proxy decides where the request lands, so pinning does not apply.
-		tr.Proxy = http.ProxyURL(p.proxy)
-		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return conns.dial(ctx, dialer, network, addr)
-		}
+		// A proxied request is dialled to the proxy, which the pinning dialer
+		// leaves alone: it only pins the domain under test. A request no_proxy
+		// sends direct is pinned like any other.
+		tr.Proxy = func(r *http.Request) (*url.URL, error) { return p.proxy(r.URL) }
 		if len(p.cfg.ProxyHeaders) > 0 {
 			tr.ProxyConnectHeader = http.Header{}
 			for k, v := range p.cfg.ProxyHeaders {
@@ -250,9 +302,16 @@ func (p *Prober) client(req probe.Request, u *url.URL) (*http.Client, *connSet) 
 		c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	} else {
 		limit := p.cfg.MaxRedirects
-		c.CheckRedirect = func(_ *http.Request, via []*http.Request) error {
+		c.CheckRedirect = func(r *http.Request, via []*http.Request) error {
 			if len(via) >= limit {
 				return fmt.Errorf("redirect limit exceeded (%d)", limit)
+			}
+			// The presented name is pinned to the transport, so following a
+			// redirect elsewhere would offer it to a host it does not belong
+			// to. Another domain is another service, as it is for the backend.
+			if req.Hostname != "" && !sameName(r.URL.Hostname(), origin) {
+				return fmt.Errorf("redirect to %s: hostname=%s is the name presented to %s, and another host is another service",
+					r.URL.Host, req.Hostname, origin)
 			}
 			return nil
 		}
@@ -291,6 +350,9 @@ func asciiHost(host string) string {
 	}
 	return host
 }
+
+// sameName compares two host names, in the form the transport dials them.
+func sameName(a, b string) bool { return strings.EqualFold(asciiHost(a), asciiHost(b)) }
 
 func sameHost(addr, host string) bool {
 	h, _, err := net.SplitHostPort(addr)
@@ -377,13 +439,13 @@ func (p *Prober) drain(resp *http.Response) (string, int64, error) {
 func (p *Prober) recordResponse(rec *metrics.Recorder, resp *http.Response, size int64, reused bool) {
 	rec.Gauge("http_status_code", float64(resp.StatusCode))
 	rec.Gauge("http_response_size_bytes", float64(size))
-	rec.Gauge("http_connection_reused", boolValue(reused))
+	rec.Gauge("http_connection_reused", metrics.Bool(reused))
 	rec.Info("http_proto_info", resp.Proto)
 	if resp.ContentLength >= 0 {
 		rec.Gauge("http_content_length", float64(resp.ContentLength))
 	}
 	rec.Gauge("http_redirects", float64(hops(resp)))
-	rec.Gauge("http_ssl", boolValue(resp.TLS != nil))
+	rec.Gauge("http_ssl", metrics.Bool(resp.TLS != nil))
 	if lm := resp.Header.Get("Last-Modified"); lm != "" {
 		if t, err := http.ParseTime(lm); err == nil {
 			rec.Gauge("http_last_modified_seconds", float64(t.Unix()))
@@ -510,11 +572,4 @@ func classify(t *timings) probe.FailureReason {
 	default:
 		return probe.ReasonProtocol
 	}
-}
-
-func boolValue(b bool) float64 {
-	if b {
-		return 1
-	}
-	return 0
 }

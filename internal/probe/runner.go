@@ -54,6 +54,9 @@ type Runner struct {
 	Negative bool
 	// Requests repeats the check within one run, for a better latency sample.
 	Requests int
+	// Hostname is the name every request of this probe presents, whatever the
+	// target is called.
+	Hostname string
 
 	// Sem caps simultaneous backend requests across the whole node.
 	Sem chan struct{}
@@ -192,6 +195,7 @@ func (r *Runner) RunOnce(ctx context.Context, sink metrics.Sink) {
 	)
 	forEach(ctx, targets, r.resolveWorkers(len(targets)), func(t Target) {
 		tr := &targetRun{target: t, rec: metrics.NewRecorder(r.TargetLabels(t))}
+		tr.rec.Gauge(SeriesTimeout, r.Timeout.Seconds())
 		local := r.plan(ctx, tr)
 		mu.Lock()
 		runs = append(runs, tr)
@@ -334,7 +338,7 @@ func (r *Runner) probeAll(ctx context.Context, units []unit) {
 }
 
 func (r *Runner) request(t Target, b Backend) Request {
-	return Request{Target: t, Backend: b, Buckets: r.Buckets, SourceIP: r.SourceIP}
+	return Request{Target: t, Backend: b, Buckets: r.Buckets, SourceIP: r.SourceIP, Hostname: r.Hostname}
 }
 
 func (r *Runner) acquire(ctx context.Context) bool {

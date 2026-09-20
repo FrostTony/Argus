@@ -54,7 +54,10 @@ type CheckRequest struct {
 	Spec  *config.Probe
 	// Target overrides the probe's targets with a single one.
 	Target string
-	Debug  bool
+	// Hostname is the name to present to the target, when it differs from the
+	// target's own — blackbox's hostname=.
+	Hostname string
+	Debug    bool
 }
 
 // Check runs one probe once and returns the result without touching the store.
@@ -76,14 +79,38 @@ func (a *App) Check(ctx context.Context, req CheckRequest) (*CheckResult, error)
 	return res, nil
 }
 
+// Exposition is one on-demand run, ready to render for Prometheus.
+type Exposition struct {
+	// Samples are this node's own series, which the node's prefix applies to.
+	Samples []metrics.Sample
+	// Aliases are blackbox_exporter's names for the measurements both tools
+	// take the same way. They carry no prefix: whatever reads them was written
+	// against blackbox, and those names are what they are.
+	Aliases []metrics.Sample
+	// Log is the run's trace, when one was asked for.
+	Log []string
+}
+
 // Samples runs one probe once and returns what it measured.
-func (a *App) Samples(ctx context.Context, req CheckRequest) ([]metrics.Sample, error) {
-	runner, capture, _, _, err := a.checkOnce(ctx, req)
+func (a *App) Samples(ctx context.Context, req CheckRequest) (Exposition, error) {
+	runner, capture, trace, _, err := a.checkOnce(ctx, req)
 	if err != nil {
-		return nil, err
+		return Exposition{}, err
 	}
-	out := capture.collected()
-	return append(out, rollUp(runner, capture)...), nil
+	out := append(capture.collected(), rollUp(runner, capture)...)
+	// One run is not a distribution. A histogram scraped here has a count of
+	// one and never moves, so rate() over it reads as nothing happening; the
+	// *_last_duration_seconds gauge beside it carries the measurement.
+	out = slices.DeleteFunc(out, func(s metrics.Sample) bool { return s.Value.Kind() == metrics.KindDist })
+
+	exp := Exposition{Samples: out}
+	if a.Cfg.HTTP.API.ProbeAliases {
+		exp.Aliases = blackboxAliases(out, capture.regexFailed)
+	}
+	if trace != nil {
+		exp.Log = trace.lines()
+	}
+	return exp, nil
 }
 
 // rollUp adds probe_success, one series per target, where probe_up is per
@@ -107,7 +134,7 @@ func rollUp(runner *probe.Runner, capture *captureSink) []metrics.Sample {
 			Name: "probe_success",
 			// The target as the runner knows it, so the labels match.
 			Labels: runner.TargetLabels(known),
-			Value:  metrics.Gauge(boolValue(up)),
+			Value:  metrics.Gauge(metrics.Bool(up)),
 		})
 	}
 	return out
@@ -169,6 +196,9 @@ func (a *App) checkConfig(req CheckRequest) (config.Probe, error) {
 		}
 		pc.Targets = config.Targets{Static: []config.Target{t}}
 	}
+	if req.Hostname != "" {
+		pc.Hostname = req.Hostname
+	}
 	if pc.Targets.Empty() {
 		return pc, fmt.Errorf("probe %q has no targets and none was given", pc.Name)
 	}
@@ -219,8 +249,10 @@ func allUp(targets []TargetCheck) bool {
 type captureSink struct {
 	mu      sync.Mutex
 	samples []metrics.Sample
-	// errs holds the message behind each failure, keyed by target and backend.
-	errs map[key]string
+	// errs holds the failure behind each result, keyed by target and backend.
+	// The error rather than its text: the classification on it answers what
+	// kind of check failed, which the message only describes.
+	errs map[key]error
 }
 
 type key struct{ target, backend string }
@@ -244,13 +276,13 @@ func (c *captureSink) observe(req probe.Request, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.errs == nil {
-		c.errs = map[key]string{}
+		c.errs = map[key]error{}
 	}
 	var backend string
 	if req.Backend.Valid() {
 		backend = req.Backend.String()
 	}
-	c.errs[key{req.Target.Name, backend}] = err.Error()
+	c.errs[key{req.Target.Name, backend}] = err
 }
 
 // targets regroups the flat sample stream by target and backend.
@@ -299,7 +331,9 @@ func (c *captureSink) targets() []TargetCheck {
 	for _, k := range order {
 		tc := target(k.target)
 		entry := byKey[k]
-		entry.Error = c.errs[k]
+		if err := c.errs[k]; err != nil {
+			entry.Error = err.Error()
+		}
 		tc.Backends = append(tc.Backends, *entry)
 	}
 	// A target that never got as far as a backend reports why here.
@@ -307,8 +341,8 @@ func (c *captureSink) targets() []TargetCheck {
 		if len(out[i].Backends) > 0 || out[i].Total > 0 {
 			continue
 		}
-		if msg, ok := c.errs[key{out[i].Target, ""}]; ok {
-			out[i].Error = msg
+		if err, ok := c.errs[key{out[i].Target, ""}]; ok {
+			out[i].Error = err.Error()
 			continue
 		}
 		out[i].Error = "the target produced no result"
@@ -412,4 +446,17 @@ func format(rec map[string]any) string {
 		}
 	}
 	return b.String()
+}
+
+// regexFailed reports whether a pattern is what failed this target, on any of
+// its backends.
+func (c *captureSink) regexFailed(target string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for k, err := range c.errs {
+		if k.target == target && probe.RegexFailure(err) {
+			return true
+		}
+	}
+	return false
 }

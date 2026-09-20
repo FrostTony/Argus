@@ -69,16 +69,16 @@ func (v *Validator) compile() error {
 		v.codes = append(v.codes, r)
 	}
 	var err error
-	if v.bodyRe, err = compileRe(v.BodyRegex); err != nil {
+	if v.bodyRe, err = probe.Pattern(v.BodyRegex); err != nil {
 		return fmt.Errorf("body_regex: %w", err)
 	}
-	if v.bodyNotRe, err = compileRe(v.BodyNotRegex); err != nil {
+	if v.bodyNotRe, err = probe.Pattern(v.BodyNotRegex); err != nil {
 		return fmt.Errorf("body_not_regex: %w", err)
 	}
-	if v.headerRe, err = compileRe(v.HeaderRegex); err != nil {
+	if v.headerRe, err = probe.Pattern(v.HeaderRegex); err != nil {
 		return fmt.Errorf("header_regex: %w", err)
 	}
-	if v.jsonRe, err = compileRe(v.JSONRegex); err != nil {
+	if v.jsonRe, err = probe.Pattern(v.JSONRegex); err != nil {
 		return fmt.Errorf("json_regex: %w", err)
 	}
 	if v.headerRe != nil && v.Header == "" {
@@ -96,13 +96,6 @@ func (v *Validator) compile() error {
 		return fmt.Errorf("require_tls and forbid_tls are mutually exclusive")
 	}
 	return nil
-}
-
-func compileRe(s string) (*regexp.Regexp, error) {
-	if s == "" {
-		return nil, nil
-	}
-	return regexp.Compile(s)
 }
 
 // parseCodeRange reads "200", "200-399" or "2xx".
@@ -136,7 +129,8 @@ func (p *Prober) validate(rec *metrics.Recorder, resp *http.Response, body strin
 	for i := range p.validators {
 		v := &p.validators[i]
 		err := v.check(resp, body, size, now)
-		rec.Gauge("http_validator", boolValue(err == nil), "validator", v.Name)
+		rec.Gauge("http_validator", metrics.Bool(err == nil), "validator", v.Name)
+		v.expectInfo(rec, resp, body)
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -144,18 +138,29 @@ func (p *Prober) validate(rec *metrics.Recorder, resp *http.Response, body strin
 	return firstErr
 }
 
+// expectInfo publishes the named capture groups of whatever matched, so that a
+// version string or a build id read out of the answer becomes a label.
+func (v *Validator) expectInfo(rec *metrics.Recorder, resp *http.Response, body string) {
+	if probe.Named(v.bodyRe) {
+		probe.ExpectInfo(rec, v.bodyRe, v.bodyRe.FindStringSubmatch(body), "validator", v.Name)
+	}
+	if probe.Named(v.headerRe) {
+		probe.ExpectInfo(rec, v.headerRe, v.headerRe.FindStringSubmatch(resp.Header.Get(v.Header)), "validator", v.Name)
+	}
+}
+
 func (v *Validator) check(resp *http.Response, body string, size int64, now time.Time) error {
 	if len(v.codes) > 0 && !matchCode(v.codes, resp.StatusCode) {
 		return probe.Fail(probe.ReasonStatus, "%s: got %d, want %s", v.Name, resp.StatusCode, strings.Join(v.StatusCode, ","))
 	}
 	if v.bodyRe != nil && !v.bodyRe.MatchString(body) {
-		return probe.Fail(probe.ReasonContent, "%s: body does not match %q", v.Name, v.BodyRegex)
+		return probe.FailRegex("%s: body does not match %q", v.Name, v.BodyRegex)
 	}
 	if v.bodyNotRe != nil && v.bodyNotRe.MatchString(body) {
-		return probe.Fail(probe.ReasonContent, "%s: body matches forbidden %q", v.Name, v.BodyNotRegex)
+		return probe.FailRegex("%s: body matches forbidden %q", v.Name, v.BodyNotRegex)
 	}
 	if v.headerRe != nil && !v.headerRe.MatchString(resp.Header.Get(v.Header)) {
-		return probe.Fail(probe.ReasonContent, "%s: header %s does not match %q", v.Name, v.Header, v.HeaderRegex)
+		return probe.FailRegex("%s: header %s does not match %q", v.Name, v.Header, v.HeaderRegex)
 	}
 	if len(v.HTTPVersion) > 0 && !slices.Contains(v.HTTPVersion, resp.Proto) {
 		return probe.Fail(probe.ReasonProtocol, "%s: %s is not one of %s",
@@ -205,7 +210,7 @@ func (v *Validator) checkJSON(body string) error {
 		return probe.Fail(probe.ReasonContent, "%s: %s = %q, want %q", v.Name, v.JSONPath, got, v.JSONEquals)
 	}
 	if v.jsonRe != nil && !v.jsonRe.MatchString(got) {
-		return probe.Fail(probe.ReasonContent, "%s: %s = %q does not match %q", v.Name, v.JSONPath, got, v.JSONRegex)
+		return probe.FailRegex("%s: %s = %q does not match %q", v.Name, v.JSONPath, got, v.JSONRegex)
 	}
 	return nil
 }

@@ -12,7 +12,7 @@ import (
 )
 
 // Version is the release this build is of; -ldflags stamps a tag over it.
-var Version = "0.0.1"
+var Version = "0.0.2"
 
 // Revision is the commit this binary was built from.
 var Revision = revision()
@@ -43,14 +43,20 @@ func VersionString() string {
 	return Version + "+" + Revision
 }
 
-var started = time.Now()
+// selfRecorder puts every series it records under metrics.SelfPrefix. It is
+// not the Recorder embedded, so that a self metric cannot be written
+// unprefixed by reaching past it.
+type selfRecorder struct{ rec *metrics.Recorder }
 
-func boolValue(b bool) float64 {
-	if b {
-		return 1
-	}
-	return 0
+func (s selfRecorder) Gauge(name string, v float64, extra ...string) {
+	s.rec.Gauge(metrics.SelfPrefix+name, v, extra...)
 }
+
+func (s selfRecorder) Info(name, text string, extra ...string) {
+	s.rec.Info(metrics.SelfPrefix+name, text, extra...)
+}
+
+var started = time.Now()
 
 const selfInterval = 15 * time.Second
 
@@ -86,7 +92,8 @@ func (a *App) selfBatch() metrics.Batch {
 	return b
 }
 
-func (a *App) collectSelf(rec *metrics.Recorder) {
+func (a *App) collectSelf(r *metrics.Recorder) {
+	rec := selfRecorder{r}
 	a.mu.Lock()
 	probes := len(a.probes)
 	a.mu.Unlock()
@@ -119,7 +126,7 @@ func (a *App) collectSelf(rec *metrics.Recorder) {
 		rec.Gauge("probe_panics", float64(r.Panics()), "probe", r.Name)
 		rec.Gauge("probe_backends_down", float64(r.Down()), "probe", r.Name)
 		rec.Gauge("probe_runs_paused", float64(r.Paused()), "probe", r.Name)
-		rec.Gauge("probe_sleeping", boolValue(r.Sleeping()), "probe", r.Name)
+		rec.Gauge("probe_sleeping", metrics.Bool(r.Sleeping()), "probe", r.Name)
 	}
 }
 

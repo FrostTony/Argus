@@ -48,7 +48,6 @@ type Result struct {
 	// Cached answers are not recorded in the resolution metrics.
 	Cached bool
 	Server string
-	At     time.Time
 }
 
 // Resolver turns a name into addresses of one family. Implementations are safe
@@ -74,7 +73,7 @@ func (s *System) Resolve(ctx context.Context, host string, family Family) (Resul
 	defer cancel()
 	start := time.Now()
 	addrs, err := net.DefaultResolver.LookupNetIP(ctx, network(family), host)
-	res := Result{Duration: time.Since(start), Server: "system", At: time.Now()}
+	res := Result{Duration: time.Since(start), Server: "system"}
 	if err != nil {
 		return res, err
 	}
@@ -121,7 +120,7 @@ func (s Static) Resolve(_ context.Context, _ string, family Family) (Result, err
 	if len(addrs) == 0 {
 		return Result{Server: "static"}, ErrNoAddresses
 	}
-	return Result{Addrs: addrs, Server: "static", At: time.Now()}, nil
+	return Result{Addrs: addrs, Server: "static"}, nil
 }
 
 // Literal recognises a target that is already an IP.

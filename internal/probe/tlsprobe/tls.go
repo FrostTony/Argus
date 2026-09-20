@@ -31,7 +31,7 @@ type Prober struct {
 func New(pc config.Probe) (probe.Prober, error) {
 	// Port stays zero so an explicit target or backend port wins; 443 is the
 	// fallback applied last in Address.
-	cfg := Config{MinDaysLeft: 0}
+	var cfg Config
 	if err := pc.DecodeOptions(&cfg); err != nil {
 		return nil, err
 	}
@@ -56,7 +56,7 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 
 	// SNI is the domain, not the backend address: a certificate names a host.
 	var seen *tls.ConnectionState
-	cfg := tlsinfo.Observed(p.base, cmp.Or(p.base.ServerName, req.Target.Host),
+	cfg := tlsinfo.Observed(p.base, cmp.Or(p.base.ServerName, req.ServerName()),
 		func(cs tls.ConnectionState) { seen = &cs })
 
 	start := time.Now()
@@ -75,9 +75,14 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 
 	// Recorded whether or not the certificate was accepted.
 	now := time.Now()
-	tlsinfo.Record(rec, seen, now)
+	over, revoked := tlsinfo.Inspect(ctx, rec, seen, p.cfg.Options, now)
+	res.Overhead += over
 	if err != nil {
 		res.Err = probe.Wrap(probe.ReasonTLS, err)
+		return res
+	}
+	if revoked != nil {
+		res.Err = probe.Fail(probe.ReasonTLS, "%v", revoked)
 		return res
 	}
 	st := tconn.ConnectionState()

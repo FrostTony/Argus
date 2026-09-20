@@ -174,7 +174,7 @@ func (p *Prober) report(doc *rdapDomain, name string, rec *metrics.Recorder) err
 	if len(doc.Status) > 0 {
 		rec.Info("domain_status_info", strings.Join(doc.Status, ","))
 	}
-	rec.Gauge("domain_locked", boolValue(has(doc.Status, "clienttransferprohibited")))
+	rec.Gauge("domain_locked", metrics.Bool(has(doc.Status, "clienttransferprohibited")))
 
 	if !hasExpiry {
 		// Some ccTLD registries publish no expiry; zero days would be a fiction.
@@ -266,13 +266,6 @@ func has(list []string, want string) bool {
 
 func foldStatus(s string) string {
 	return strings.ToLower(strings.NewReplacer(" ", "", "-", "", "_", "").Replace(s))
-}
-
-func boolValue(b bool) float64 {
-	if b {
-		return 1
-	}
-	return 0
 }
 
 // round renders a duration as whole days once it exceeds one.

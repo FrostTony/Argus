@@ -41,6 +41,10 @@ type API struct {
 	// ProbeEndpoint serves /probe, one check on demand as a Prometheus
 	// exposition. On by default, and authorised like /api/check.
 	ProbeEndpoint bool `yaml:"probe_endpoint"`
+	// ProbeAliases adds blackbox_exporter's names for the series it and Argus
+	// both measure, on /probe only. On by default: the endpoint exists to be
+	// scraped by a configuration written for blackbox.
+	ProbeAliases bool `yaml:"probe_aliases"`
 	// Token authorises both reads and writes unless ReadToken is set.
 	Token string `yaml:"token"`
 	// ReadToken, when set, authorises reads only.
@@ -162,7 +166,7 @@ func DefaultServer() Server {
 			Listen:      ":6767",
 			MetricsPath: "/metrics",
 			Timeout:     Duration(30 * time.Second),
-			API:         API{ReadAuth: AuthToken, WriteAuth: AuthToken, ProbeEndpoint: true},
+			API:         API{ReadAuth: AuthToken, WriteAuth: AuthToken, ProbeEndpoint: true, ProbeAliases: true},
 		},
 		Resolver: Resolver{
 			Mode:        "system",
@@ -223,7 +227,10 @@ var reservedPaths = map[string]bool{
 
 // Exposition returns the settings /metrics and remote-write render with.
 func (s *Server) Exposition() PrometheusSurfacer {
-	out := PrometheusSurfacer{Prefix: "argus_"}
+	// Empty by default: probe_success, probe_duration_seconds and the rest are
+	// the names blackbox_exporter dashboards and rules already reference. The
+	// agent's own series carry app.SelfPrefix in their name instead.
+	var out PrometheusSurfacer
 	for _, sf := range s.Surfacers {
 		if sf.Type == "prometheus" && sf.Prometheus != nil {
 			if sf.Prometheus.Prefix != "" {

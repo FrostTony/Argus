@@ -51,6 +51,10 @@ type Probe struct {
 	// SourceIP binds outgoing connections to one local address.
 	SourceIP string `yaml:"source_ip,omitempty"`
 
+	// Hostname is the name presented to the target — Host header and SNI —
+	// when it differs from the target's own. blackbox spells it hostname=.
+	Hostname string `yaml:"hostname,omitempty"`
+
 	// Schedule limits when the probe runs.
 	Schedule *Schedule `yaml:"schedule,omitempty"`
 	// NegativeTest inverts the outcome: the check passes when it fails.
@@ -63,13 +67,20 @@ type Probe struct {
 	Options yaml.Node `yaml:"-"`
 }
 
-var probeFields = map[string]bool{
-	"name": true, "type": true, "template": true, "disabled": true,
-	"interval": true, "timeout": true, "per_backend": true,
-	"labels": true, "targets": true, "latency_buckets": true,
-	"ip_version": true, "ip_fallback": true, "source_ip": true,
-	"schedule": true, "negative_test": true, "requests_per_probe": true, "run_on": true,
-}
+// probeFields are the keys a probe answers to itself; anything else is the
+// block named after its type. Derived from the struct rather than listed, so
+// that a new common option cannot be read as somebody's prober block.
+var probeFields = func() map[string]bool {
+	out := map[string]bool{}
+	t := reflect.TypeFor[Probe]()
+	for i := range t.NumField() {
+		name, _, _ := strings.Cut(t.Field(i).Tag.Get("yaml"), ",")
+		if name != "" && name != "-" {
+			out[name] = true
+		}
+	}
+	return out
+}()
 
 func (p *Probe) UnmarshalYAML(n *yaml.Node) error {
 	if n.Kind != yaml.MappingNode {

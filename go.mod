@@ -4,6 +4,7 @@ go 1.24
 
 require (
 	github.com/golang/snappy v0.0.4
+	golang.org/x/crypto v0.25.0
 	github.com/miekg/dns v1.1.62
 	golang.org/x/net v0.27.0
 	golang.org/x/sys v0.22.0

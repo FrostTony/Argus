@@ -32,6 +32,10 @@ http:
     # lets a scrape name the target: the list of targets then lives in
     # Prometheus's service discovery rather than in probes.d/. On by default.
     # probe_endpoint: false
+    # Alongside Argus's own names, /probe publishes blackbox_exporter's for the
+    # series both measure the same way, so a dashboard written for blackbox
+    # works unchanged. /metrics never carries them.
+    # probe_aliases: false
   # tls:
   #   cert_file: /etc/argus/tls/server.crt
   #   key_file: /etc/argus/tls/server.key
@@ -72,8 +76,12 @@ probing:
 
 surfacers:
   - type: prometheus
-    prometheus:
-      prefix: argus_
+    # No prefix by default: probe_success, probe_duration_seconds and probe_up
+    # are the names blackbox dashboards and alerting rules already use. Set one
+    # when several nodes write into one store through remote-write and their
+    # series must not meet. The node's own counters stay argus_* either way.
+    # prometheus:
+    #   prefix: argus_
 
   # - type: file
   #   file:

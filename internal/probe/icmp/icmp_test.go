@@ -72,22 +72,23 @@ func TestReplyMatchingNeedsTheToken(t *testing.T) {
 	reply := func(body icmp.MessageBody) *icmp.Message {
 		return &icmp.Message{Type: ipv4.ICMPTypeEchoReply, Body: body}
 	}
-	if !ours(reply(&icmp.Echo{Seq: 2, Data: append(token, 0, 0)}), 2, token) {
-		t.Error("our own reply was rejected")
+	if seq, ok := echoOf(reply(&icmp.Echo{Seq: 2, Data: append(token, 0, 0)}), token); !ok || seq != 2 {
+		t.Errorf("our own reply was rejected: seq %d, ok %v", seq, ok)
 	}
-	if ours(reply(&icmp.Echo{Seq: 2, Data: append(other, 0, 0)}), 2, token) {
+	if _, ok := echoOf(reply(&icmp.Echo{Seq: 2, Data: append(other, 0, 0)}), token); ok {
 		t.Error("another probe's reply was accepted")
 	}
-	if ours(reply(&icmp.Echo{Seq: 1, Data: token}), 2, token) {
-		t.Error("an earlier packet of ours was accepted")
-	}
-	if ours(reply(&icmp.DstUnreach{}), 2, token) {
+	if _, ok := echoOf(reply(&icmp.DstUnreach{}), token); ok {
 		t.Error("a non-echo body was accepted")
 	}
 	// A raw socket pinging a local address sees its own request, token and all.
 	request := &icmp.Message{Type: ipv4.ICMPTypeEcho, Body: &icmp.Echo{Seq: 2, Data: token}}
-	if ours(request, 2, token) {
+	if _, ok := echoOf(request, token); ok {
 		t.Error("our own echo request was accepted as the reply")
+	}
+	// An earlier packet of ours is ours, and the caller decides it is a duplicate.
+	if seq, ok := echoOf(reply(&icmp.Echo{Seq: 1, Data: token}), token); !ok || seq != 1 {
+		t.Errorf("an earlier reply of ours was not recognised: seq %d, ok %v", seq, ok)
 	}
 }
 

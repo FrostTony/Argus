@@ -701,8 +701,8 @@ func TestProbeEndpointRendersAnExposition(t *testing.T) {
 		t.Fatalf("/probe: %d %s", code, body)
 	}
 	for _, want := range []string{
-		"# TYPE argus_probe_success gauge",
-		`argus_probe_success{`,
+		"# TYPE probe_success gauge",
+		`probe_success{`,
 		`probe="one"`,
 		`target="1.1.1.1"`,
 	} {
@@ -722,7 +722,7 @@ func TestProbeEndpointReportsFailureAsZero(t *testing.T) {
 	}
 
 	_, body := do(t, ts, http.MethodGet, "/probe?probe=one", "tok", "")
-	if !strings.Contains(body, "argus_probe_success{") || !strings.Contains(body, "} 0") {
+	if !strings.Contains(body, "probe_success{") || !strings.Contains(body, "} 0") {
 		t.Fatalf("a failed check did not report probe_success 0:\n%s", body)
 	}
 }
@@ -743,7 +743,7 @@ func TestProbeEndpointStoresNothing(t *testing.T) {
 func TestProbeEndpointAcceptsModuleAlias(t *testing.T) {
 	ts := serve(t, newApp(t), nil)
 	code, body := do(t, ts, http.MethodGet, "/probe?module=one&target=1.1.1.1", "tok", "")
-	if code != http.StatusOK || !strings.Contains(body, "argus_probe_success") {
+	if code != http.StatusOK || !strings.Contains(body, "probe_success") {
 		t.Fatalf("module= was not accepted: %d %s", code, body)
 	}
 }
@@ -801,5 +801,109 @@ func TestLogoPathIsReserved(t *testing.T) {
 	c.HTTP.MetricsPath = "/logo.png"
 	if err := c.Validate(); err == nil {
 		t.Fatal("metrics_path /logo.png was accepted")
+	}
+}
+
+// The trace goes out as comments: a debug scrape is still an exposition.
+func TestProbeEndpointDebugTracesInComments(t *testing.T) {
+	ts := serve(t, newApp(t), nil)
+
+	code, body := do(t, ts, http.MethodGet, "/probe?probe=one&target=1.1.1.1&debug=true", "tok", "")
+	if code != http.StatusOK {
+		t.Fatalf("/probe: %d %s", code, body)
+	}
+	if !strings.Contains(body, "probe_success{") {
+		t.Errorf("debug=true dropped the exposition:\n%s", body)
+	}
+
+	trace := 0
+	for _, line := range strings.Split(body, "\n") {
+		switch {
+		case line == "" || strings.HasPrefix(line, "# HELP ") || strings.HasPrefix(line, "# TYPE "):
+		case strings.HasPrefix(line, "# "):
+			trace++
+		case strings.ContainsAny(line, "{ "):
+			// A series line: name, optional labels, value.
+			if !metricLine.MatchString(line) {
+				t.Errorf("a trace line was not commented out: %q", line)
+			}
+		}
+	}
+	if trace == 0 {
+		t.Error("debug=true produced no trace at all")
+	}
+
+	// Without it the answer carries no comments but HELP and TYPE.
+	_, plain := do(t, ts, http.MethodGet, "/probe?probe=one&target=1.1.1.1", "tok", "")
+	for _, line := range strings.Split(plain, "\n") {
+		if strings.HasPrefix(line, "# ") && !strings.HasPrefix(line, "# HELP ") && !strings.HasPrefix(line, "# TYPE ") {
+			t.Errorf("a trace line appeared without debug=true: %q", line)
+		}
+	}
+}
+
+// metricLine is what a sample looks like in the text format.
+var metricLine = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*(\{.*\})? `)
+
+// The trace carries what the target answered and what was asked of it, which is
+// more than the measurement a read token is for.
+func TestProbeEndpointNeedsWritePermissionForDebug(t *testing.T) {
+	a := newAppWith(t, func(c *config.Server) { c.HTTP.API.ReadToken = "readonly" })
+	ts := serve(t, a, nil)
+
+	if code, _ := do(t, ts, http.MethodGet, "/probe?probe=one&debug=true", "readonly", ""); code != http.StatusUnauthorized {
+		t.Errorf("debug=true was served to a read token, code %d", code)
+	}
+	if code, _ := do(t, ts, http.MethodGet, "/api/check?probe=one&debug=true", "readonly", ""); code != http.StatusUnauthorized {
+		t.Errorf("/api/check debug=true was served to a read token, code %d", code)
+	}
+}
+
+// The blackbox names exist to be read by something written for blackbox, so the
+// node's prefix does not apply to them.
+func TestProbeEndpointAliasesIgnoreThePrefix(t *testing.T) {
+	a := newAppWith(t, func(c *config.Server) {
+		c.Surfacers = []config.Surfacer{{Type: "prometheus", Prometheus: &config.PrometheusSurfacer{Prefix: "node1_"}}}
+	})
+	ts := serve(t, a, nil)
+
+	code, body := do(t, ts, http.MethodGet, "/probe?probe=one&target=1.1.1.1", "tok", "")
+	if code != http.StatusOK {
+		t.Fatalf("/probe: %d %s", code, body)
+	}
+	if !strings.Contains(body, "node1_probe_success{") {
+		t.Errorf("the node's own series lost its prefix:\n%s", body)
+	}
+	if strings.Contains(body, "node1_probe_failed_due_to_regex") {
+		t.Errorf("a blackbox alias was prefixed, so nothing written for blackbox can read it:\n%s", body)
+	}
+	if !strings.Contains(body, "\nprobe_failed_due_to_regex{") {
+		t.Errorf("the blackbox aliases are missing:\n%s", body)
+	}
+}
+
+// One run is not a distribution: a histogram scraped here never moves.
+func TestProbeEndpointCarriesNoHistograms(t *testing.T) {
+	ts := serve(t, newApp(t), nil)
+	_, body := do(t, ts, http.MethodGet, "/probe?probe=one&target=1.1.1.1", "tok", "")
+	if strings.Contains(body, "_bucket{") {
+		t.Errorf("a one-run histogram was exposed:\n%s", body)
+	}
+	if !strings.Contains(body, "probe_duration_seconds{") {
+		t.Errorf("blackbox's probe_duration_seconds gauge is missing:\n%s", body)
+	}
+}
+
+// Presenting another name sends the probe's credentials to a host it was not
+// configured for, so it is authorised like a chosen target.
+func TestProbeEndpointNeedsWritePermissionForAChosenHostname(t *testing.T) {
+	a := newAppWith(t, func(c *config.Server) { c.HTTP.API.ReadToken = "readonly" })
+	ts := serve(t, a, nil)
+
+	if code, _ := do(t, ts, http.MethodGet, "/probe?probe=one&hostname=elsewhere.test", "readonly", ""); code != http.StatusUnauthorized {
+		t.Errorf("hostname= was accepted with a read token, code %d", code)
+	}
+	if code, _ := do(t, ts, http.MethodGet, "/probe?probe=one&hostname=elsewhere.test", "tok", ""); code != http.StatusOK {
+		t.Error("hostname= was refused with a write token")
 	}
 }

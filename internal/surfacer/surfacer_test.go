@@ -450,6 +450,9 @@ func TestHelpDocumentsOnlyLiveMetrics(t *testing.T) {
 		collectMetricNames(t, dir, known)
 	}
 	for name := range help {
+		// The agent's own series carry app.SelfPrefix in their name; the literal
+		// they are recorded under does not. Importing app here would be a cycle.
+		name := strings.TrimPrefix(name, "argus_")
 		if !known[name] && !strings.HasPrefix(name, "tls_") && !strings.HasPrefix(name, "http_") &&
 			!strings.HasPrefix(name, "dns_") && !strings.HasPrefix(name, "icmp_") {
 			t.Errorf("help documents %q, which nothing records", name)
@@ -480,5 +483,23 @@ func collectMetricNames(t *testing.T, dir string, into map[string]bool) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The agent's own series are named in full: a configured prefix namespaces what
+// the node measures, and the node is not one of its own targets.
+func TestSelfSeriesAreNotPrefixedTwice(t *testing.T) {
+	p := &Prometheus{Prefix: "argus_", Store: storeWith(
+		metrics.Sample{Name: "argus_uptime_seconds", Value: metrics.Gauge(7)},
+		metrics.Sample{Name: "probe_up", Value: metrics.Gauge(1)},
+	)}
+	out := p.String()
+	if strings.Contains(out, "argus_argus_") {
+		t.Errorf("a self series was prefixed twice:\n%s", out)
+	}
+	for _, want := range []string{"argus_uptime_seconds 7", "argus_probe_up 1"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q:\n%s", want, out)
+		}
 	}
 }

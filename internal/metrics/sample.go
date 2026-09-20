@@ -36,10 +36,6 @@ type Sink interface {
 	Write(ctx context.Context, b Batch)
 }
 
-type SinkFunc func(context.Context, Batch)
-
-func (f SinkFunc) Write(ctx context.Context, b Batch) { f(ctx, b) }
-
 type Fanout []Sink
 
 func (fs Fanout) Write(ctx context.Context, b Batch) {

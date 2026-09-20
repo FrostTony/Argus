@@ -3,6 +3,7 @@
 package probe
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -56,7 +57,15 @@ type Request struct {
 	Buckets metrics.Buckets
 	// SourceIP binds outgoing connections to one local address.
 	SourceIP netip.Addr
+	// Hostname overrides the name the probe presents — the Host header and the
+	// SNI — without changing the address it dials. Empty means the target's own.
+	Hostname string
 }
+
+// ServerName is the name to present to the target. Overriding it is how one
+// virtual host is checked on a machine that serves many, and how blackbox's
+// hostname= is honoured.
+func (r Request) ServerName() string { return cmp.Or(r.Hostname, r.Target.Host) }
 
 // Dialer returns a dialer bound to the request's source address. The local
 // address must be of the network dialled, or the dial is refused as mismatched.
@@ -173,6 +182,11 @@ const (
 type Error struct {
 	Reason FailureReason
 	Err    error
+	// Regex marks a content failure a pattern decided, which blackbox reports
+	// separately as probe_failed_due_to_regex. It is a finer grain than the
+	// reason label, not a reason of its own: a body that does not match is a
+	// content failure either way.
+	Regex bool
 }
 
 func (e *Error) Error() string { return fmt.Sprintf("%s: %v", e.Reason, e.Err) }
@@ -181,6 +195,17 @@ func (e *Error) Unwrap() error { return e.Err }
 // Fail builds a classified failure from a message of the prober's own.
 func Fail(reason FailureReason, format string, args ...any) error {
 	return &Error{Reason: reason, Err: fmt.Errorf(format, args...)}
+}
+
+// FailRegex builds a content failure a pattern decided.
+func FailRegex(format string, args ...any) error {
+	return &Error{Reason: ReasonContent, Err: fmt.Errorf(format, args...), Regex: true}
+}
+
+// RegexFailure reports whether a pattern is what failed the check.
+func RegexFailure(err error) bool {
+	var pe *Error
+	return errors.As(err, &pe) && pe.Regex
 }
 
 // Wrap classifies a Go error; a timeout is checked before a net error, which hides it.

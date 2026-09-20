@@ -239,14 +239,14 @@ probes:
 
 	rec := metrics.NewRecorder(metrics.Labels{})
 	a.collectSelf(rec)
-	fails, ok := selfGauge(rec.Samples(), "discovery_failures")
+	fails, ok := selfGauge(rec.Samples(), "argus_discovery_failures")
 	if !ok {
 		t.Fatal("discovery_failures is never emitted, so a dead source is invisible")
 	}
 	if fails != 1 {
 		t.Errorf("discovery_failures = %v, want 1", fails)
 	}
-	if _, ok := selfGauge(rec.Samples(), "discovery_age_seconds"); !ok {
+	if _, ok := selfGauge(rec.Samples(), "argus_discovery_age_seconds"); !ok {
 		t.Error("discovery_age_seconds is missing")
 	}
 }
@@ -300,7 +300,7 @@ func TestBuildInfoCarriesTheVersion(t *testing.T) {
 
 		var found bool
 		for _, s := range rec.Samples() {
-			if s.Name != "build_info" {
+			if s.Name != "argus_build_info" {
 				continue
 			}
 			found = true

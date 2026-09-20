@@ -15,6 +15,10 @@ const (
 	SeriesResolveFail     = "resolve_failure_total"
 	SeriesResolveTTL      = "resolve_ttl_seconds"
 	SeriesResolveFallback = "resolve_fallback_total"
+	// SeriesTimeout is the deadline one request of this probe runs under. It is
+	// configuration rather than measurement, but a latency graph without it does
+	// not show where the ceiling is.
+	SeriesTimeout = "probe_timeout_seconds"
 )
 
 // Timings name both series a measurement produces.
@@ -24,8 +28,8 @@ var (
 	TimeResolve = metrics.NewTiming("resolve")
 )
 
-// targetLevel is the set of series describing a target rather than a backend.
 var targetLevel = map[string]bool{
+	SeriesTimeout:         true,
 	SeriesBackends:        true,
 	SeriesBackendsUp:      true,
 	SeriesResolveTotal:    true,

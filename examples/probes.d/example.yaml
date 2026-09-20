@@ -422,3 +422,73 @@ probes:
     run_on: "^(fra|ams)[0-9]+$"
     targets:
       - https://eu.example.com/
+
+  # A unix-domain socket: the target is the path, so there is nothing to resolve
+  # and no backend to fan out over. Steps work exactly as they do over TCP.
+  - name: example_unix
+    type: unix
+    disabled: true
+    interval: 60s
+    targets:
+      - /var/run/docker.sock
+    unix:
+      # unix (stream, the default), unixpacket, or unixgram for one datagram.
+      network: unix
+      steps:
+        - send: "GET /_ping HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n"
+          expect: "^HTTP/1\\.[01] 200"
+
+  # The RFC 6455 upgrade. A proxy that forwards HTTP and drops Upgrade answers
+  # 200 to every other check and breaks every websocket client.
+  - name: example_websocket
+    type: websocket
+    disabled: true
+    interval: 60s
+    targets:
+      - wss://echo.example.com/socket
+    websocket:
+      origin: https://app.example.com
+      subprotocols: [chat]
+      # Sending a message proves the socket carries frames, not just that it
+      # was opened. A named capture group becomes a probe_expect_info label.
+      send: "ping"
+      expect: "^(?P<pong>pong)$"
+      # Or, with nothing to say, a ping/pong round trip:
+      # ping: true
+
+  # DNS over TLS: a resolver behind DoT checked over :53/udp is a check of a
+  # path nobody uses. The resolver's own certificate comes back as tls_*.
+  - name: example_dot
+    type: dns
+    disabled: true
+    interval: 60s
+    targets:
+      - example.com
+    dns:
+      proto: tls
+      servers: ["one.one.one.one", "dns.google"]
+      query_type: A
+      tls_config:
+        # An expiry date says nothing about a key that leaked last week.
+        check_revoked: true
+
+  # DNS over HTTPS: servers are endpoints, not addresses.
+  - name: example_doh
+    type: dns
+    disabled: true
+    interval: 60s
+    targets:
+      - example.com
+    dns:
+      proto: https
+      servers: ["https://dns.google/dns-query"]
+      query_type: A
+
+  # One virtual host on a machine that serves many: hostname changes the Host
+  # header and the SNI without changing the address the probe connects to.
+  - name: example_vhost
+    type: http
+    disabled: true
+    hostname: canary.example.com
+    targets:
+      - https://edge.example.com/

@@ -174,9 +174,8 @@ func (rw *RemoteWrite) sendWithRetries(series []timeSeries) error {
 	return err
 }
 
-func (rw *RemoteWrite) Sent() int64        { return rw.sent.Load() }
-func (rw *RemoteWrite) Failures() int64    { return rw.failures.Load() }
-func (rw *RemoteWrite) LastSuccess() int64 { return rw.lastOK.Load() }
+func (rw *RemoteWrite) Sent() int64     { return rw.sent.Load() }
+func (rw *RemoteWrite) Failures() int64 { return rw.failures.Load() }
 
 func (rw *RemoteWrite) send(body []byte) error {
 	if len(body) == 0 {
@@ -306,7 +305,7 @@ func (f *flattener) name(base, suffix string) string {
 	if s, ok := f.names[k]; ok {
 		return s
 	}
-	s := f.prefix + base + suffix
+	s := metrics.Prefixed(f.prefix, base) + suffix
 	f.names[k] = s
 	return s
 }

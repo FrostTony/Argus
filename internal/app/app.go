@@ -42,10 +42,13 @@ type App struct {
 	// applyMu serialises reloads end to end.
 	applyMu sync.Mutex
 
-	mu      sync.Mutex
-	probes  map[string]*running
-	order   []string
-	source  config.Probes
+	mu     sync.Mutex
+	probes map[string]*running
+	order  []string
+	source config.Probes
+	// meta is where the running configuration came from; the API and the
+	// loader set it, /status reports it.
+	meta    ConfigMeta
 	rootCtx context.Context
 	live    sync.WaitGroup
 	// stopped is the shutdown barrier: nothing new may register with live.
@@ -195,7 +198,10 @@ func (a *App) apply(probes config.Probes) error {
 		order = append(order, pc.Name)
 	}
 	if len(next) == 0 {
-		return fmt.Errorf("no enabled probes")
+		// Legal: a node that has just been installed, or one whose last domain
+		// was taken away, has nothing to check. Loud, because silence here
+		// looks exactly like health.
+		a.Log.Warn("no probe runs on this node: the configuration is empty, disabled or meant for other nodes")
 	}
 
 	a.mu.Lock()
@@ -315,6 +321,7 @@ func (a *App) buildRunner(pc config.Probe, nodeLabels metrics.Labels) (*probe.Ru
 		Schedule:    schedule,
 		Negative:    config.Enabled(pc.NegativeTest, false),
 		Requests:    pc.RequestsPerProbe,
+		Hostname:    pc.Hostname,
 		MaxBackends: a.Cfg.Resolver.MaxBackends,
 		PerBackend:  config.Enabled(pc.PerBackend, a.Cfg.Probing.PerBackend),
 		Sem:         a.sem,
@@ -367,7 +374,6 @@ func (a *App) Start(ctx context.Context) {
 	go func() { defer a.live.Done(); a.reportSelf(ctx) }()
 	<-ctx.Done()
 
-	// Nothing may be started past this point.
 	a.mu.Lock()
 	a.stopped = true
 	a.mu.Unlock()
@@ -428,6 +434,21 @@ func (a *App) Probes() config.Probes {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.source
+}
+
+// SetConfigMeta records where the configuration now running came from. It is
+// set after a successful apply, so a rejected push leaves the old value alone.
+func (a *App) SetConfigMeta(source, hash string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.meta = ConfigMeta{Source: source, Hash: hash, AppliedAt: time.Now()}
+}
+
+// ConfigMeta is what the node says about its current configuration.
+func (a *App) ConfigMeta() ConfigMeta {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.meta
 }
 
 // RunOnce runs one probe or all of them once, under the overlap guard.

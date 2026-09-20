@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -148,28 +149,18 @@ func (s *api) checkTimeout(r *http.Request) time.Duration {
 	return limit - min(answerMargin, limit/2)
 }
 
-// read wraps a handler behind the read tokens.
-func (s *api) read(h http.HandlerFunc) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.authorized(r, s.cfg.ReadTokens()) {
-			writeJSON(w, http.StatusUnauthorized, errorBody{"unauthorized"})
-			return
-		}
-		h(w, r)
-	})
-}
-
 // check runs one probe once, storing nothing. Running a configured probe as
-// configured is a read; a definition or a target override is a write.
+// configured is a read; a definition, a target or a hostname override is a write.
 func (s *api) check(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodPut {
 		writeJSON(w, http.StatusMethodNotAllowed, errorBody{"use GET or POST"})
 		return
 	}
 	req := app.CheckRequest{
-		Probe:  r.URL.Query().Get("probe"),
-		Target: r.URL.Query().Get("target"),
-		Debug:  r.URL.Query().Get("debug") == "true",
+		Probe:    r.URL.Query().Get("probe"),
+		Target:   r.URL.Query().Get("target"),
+		Hostname: r.URL.Query().Get("hostname"),
+		Debug:    r.URL.Query().Get("debug") == "true",
 	}
 
 	// A body, when present, is a probe definition of its own.
@@ -190,7 +181,7 @@ func (s *api) check(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tokens := s.cfg.ReadTokens()
-	if req.Spec != nil || req.Target != "" {
+	if req.Spec != nil || req.Target != "" || req.Hostname != "" || req.Debug {
 		tokens = s.cfg.WriteTokens()
 	}
 	if !s.authorized(r, tokens) {
@@ -210,21 +201,50 @@ func (s *api) check(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
+// render writes one set of samples. The aliases go through a store of their own
+// so that they can be written without this node's prefix.
+func render(ctx context.Context, w io.Writer, samples []metrics.Sample, prefix string, timestamps bool) {
+	if len(samples) == 0 {
+		return
+	}
+	store := metrics.NewStore(0, 0)
+	store.Write(ctx, metrics.Batch{Time: time.Now(), Samples: samples})
+	prom := &surfacer.Prometheus{Store: store, Prefix: prefix, Timestamps: timestamps}
+	_, _ = prom.WriteTo(w)
+}
+
+// comment folds a log record onto one line: anything that ends a line would end
+// the comment with it and leave the rest to be parsed as a series.
+func comment(line string) string {
+	return strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' {
+			return ' '
+		}
+		return r
+	}, line)
+}
+
 // probeExposition runs one check and renders it as a Prometheus exposition,
-// under this node's own prefix, storing nothing.
+// storing nothing.
 func (s *api) probeExposition(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, errorBody{"use GET"})
 		return
 	}
 	// "module" is accepted as an alias for "probe".
+	q := r.URL.Query()
 	req := app.CheckRequest{
-		Probe:  cmp.Or(r.URL.Query().Get("probe"), r.URL.Query().Get("module")),
-		Target: r.URL.Query().Get("target"),
+		Probe:    cmp.Or(q.Get("probe"), q.Get("module")),
+		Target:   q.Get("target"),
+		Hostname: q.Get("hostname"),
+		Debug:    q.Get("debug") == "true",
 	}
-	// Choosing a target sends the probe's credentials there, which is a write.
+	// Choosing a target or the name presented to it sends the probe's
+	// credentials somewhere it was not configured to send them: a write. So is
+	// the trace, which carries what the target answered and what was asked of
+	// it — more than the measurement a read token is for.
 	tokens := s.cfg.ReadTokens()
-	if req.Target != "" {
+	if req.Target != "" || req.Hostname != "" || req.Debug {
 		tokens = s.cfg.WriteTokens()
 	}
 	if !s.authorized(r, tokens) {
@@ -235,20 +255,22 @@ func (s *api) probeExposition(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.checkTimeout(r))
 	defer cancel()
 
-	samples, err := s.app.Samples(ctx, req)
+	exp, err := s.app.Samples(ctx, req)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorBody{err.Error()})
 		return
 	}
-
-	store := metrics.NewStore(0, 0)
-	store.Write(ctx, metrics.Batch{Time: time.Now(), Samples: samples})
 	exposition := s.app.Cfg.Exposition()
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	prom := &surfacer.Prometheus{Store: store, Prefix: exposition.Prefix, Timestamps: exposition.IncludeTimestamps}
 	bw := bufio.NewWriterSize(w, 16<<10)
-	_, _ = prom.WriteTo(bw)
+	// The trace goes out as comments, so that a debug scrape is still an
+	// exposition: whoever is holding curl reads the log, Prometheus ignores it.
+	for _, line := range exp.Log {
+		_, _ = fmt.Fprintf(bw, "# %s\n", comment(line))
+	}
+	render(ctx, bw, exp.Samples, exposition.Prefix, exposition.IncludeTimestamps)
+	render(ctx, bw, exp.Aliases, "", exposition.IncludeTimestamps)
 	_ = bw.Flush()
 }
 
@@ -336,8 +358,12 @@ func (s *api) config(w http.ResponseWriter, r *http.Request) {
 					"so a restart will undo it: " + err.Error()})
 			return
 		}
+		// Recorded only now: the hash must describe a configuration that is
+		// both running and saved.
+		s.app.SetConfigMeta(app.SourceAPI, config.Hash(body))
 		s.app.Log.Info("config replaced via api",
-			"from", clientOf(r), "bytes", len(body), "probes", len(probes.List))
+			"from", clientOf(r), "bytes", len(body), "probes", len(probes.List),
+			"hash", config.Hash(body))
 		writeJSON(w, http.StatusOK, s.app.Status())
 
 	default:

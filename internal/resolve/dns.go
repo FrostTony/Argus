@@ -59,7 +59,7 @@ func (d *DNS) Resolve(ctx context.Context, host string, family Family) (Result, 
 		qtypes = qtypes[1:]
 	}
 
-	res := Result{At: time.Now()}
+	var res Result
 	var addrs []netip.Addr
 	var lastErr error
 
@@ -97,7 +97,6 @@ func (d *DNS) Resolve(ctx context.Context, host string, family Family) (Result, 
 	if len(res.Addrs) == 0 {
 		return res, ErrNoAddresses
 	}
-	res.At = time.Now()
 	return res, nil
 }
 

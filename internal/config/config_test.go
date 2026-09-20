@@ -5,6 +5,7 @@ import (
 
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -325,6 +326,52 @@ func TestReservedMetricsPathsIncludeTheAPI(t *testing.T) {
 		s.HTTP.MetricsPath = path
 		if err := s.Validate(); err == nil {
 			t.Errorf("metrics_path %q was accepted; it collides with a path the node serves", path)
+		}
+	}
+}
+
+// Probe series carry blackbox names, so the exposition adds nothing by default.
+func TestExpositionPrefixIsEmptyByDefault(t *testing.T) {
+	def := DefaultServer()
+	if got := def.Exposition().Prefix; got != "" {
+		t.Errorf("default prefix = %q, want empty: probe_success has to be named probe_success", got)
+	}
+
+	s := DefaultServer()
+	s.Surfacers = []Surfacer{{Type: "prometheus", Prometheus: &PrometheusSurfacer{Prefix: "argus_"}}}
+	if got := s.Exposition().Prefix; got != "argus_" {
+		t.Errorf("configured prefix = %q, want argus_", got)
+	}
+}
+
+// A unix probe's target is a socket path, which has no port and nothing to
+// resolve; the shorthand parser must not read it as host:port.
+func TestSocketPathIsAValidTarget(t *testing.T) {
+	var tg Target
+	if err := tg.Parse("/var/run/docker.sock"); err != nil {
+		t.Fatalf("a socket path was rejected as a target: %v", err)
+	}
+	if tg.Host != "/var/run/docker.sock" || tg.Port != 0 {
+		t.Errorf("parsed as host %q port %d, want the whole path and no port", tg.Host, tg.Port)
+	}
+}
+
+// probeFields is derived from the struct, so a field that yields no yaml name
+// would be silently swallowed as somebody's prober block instead.
+func TestEveryProbeFieldIsNamed(t *testing.T) {
+	typ := reflect.TypeFor[Probe]()
+	for i := range typ.NumField() {
+		f := typ.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		switch {
+		case f.Name == "Options":
+			continue // the prober's own block, held as a raw node
+		case f.Anonymous:
+			t.Errorf("%s is embedded, so its keys would be read as a prober block", f.Name)
+		case name == "" || name == "-":
+			t.Errorf("%s has no yaml name, so its key would be read as a prober block", f.Name)
+		case !probeFields[name]:
+			t.Errorf("%s is not in probeFields", name)
 		}
 	}
 }

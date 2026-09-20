@@ -337,7 +337,7 @@ func TestRunnerSchedulePauses(t *testing.T) {
 type emptyResolver struct{}
 
 func (emptyResolver) Resolve(context.Context, string, resolve.Family) (resolve.Result, error) {
-	return resolve.Result{Server: "empty", At: time.Now()}, nil
+	return resolve.Result{Server: "empty"}, nil
 }
 
 func TestTargetResolvingToNothingFails(t *testing.T) {

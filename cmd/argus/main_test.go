@@ -47,7 +47,10 @@ func TestUnknownCommandExplainsItself(t *testing.T) {
 
 func TestProbesFlagIsRequired(t *testing.T) {
 	if _, err := parseFlags("run", nil); err == nil {
-		t.Fatal("want an error without -probes")
+		t.Fatal("want an error without -probes and without -state")
+	}
+	if _, err := parseFlags("run", []string{"-state", "pushed.yaml"}); err != nil {
+		t.Fatalf("a node that lives on what the API pushes needs no -probes: %v", err)
 	}
 	f, err := parseFlags("run", []string{"-probes", "a.yaml", "-probes", "b.yaml"})
 	if err != nil {
@@ -180,11 +183,11 @@ probes:
 		t.Fatal(err)
 	}
 
-	_, probes, _, err := load(&flags{probes: multiFlag{path}})
+	_, ck, _, err := load(&flags{probes: multiFlag{path}})
 	if err != nil {
 		t.Fatalf("the node cannot start from what it saved: %v", err)
 	}
-	list, err := probes.Resolve()
+	list, err := ck.probes.Resolve()
 	if err != nil {
 		t.Fatal(err)
 	}

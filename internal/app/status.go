@@ -1,18 +1,41 @@
 package app
 
 import (
+	"cmp"
 	"time"
 
 	"github.com/tonyamdfrost-cmd/Argus/internal/probe"
 )
 
+// Where a check configuration came from; "none" is a node nobody has pushed to.
+const (
+	SourceFile = "file"
+	SourceAPI  = "api"
+	SourceNone = "none"
+)
+
+// ConfigMeta describes the running check configuration: where it came from and
+// which bytes it was. The hash lets the pusher tell whether the node is already
+// running what it would send.
+type ConfigMeta struct {
+	Source    string
+	Hash      string
+	AppliedAt time.Time
+}
+
 // Status is the summary served at /status: what this node currently checks.
 type Status struct {
-	Node     string        `json:"node"`
-	Uptime   string        `json:"uptime"`
-	Series   int           `json:"series"`
-	Resolver string        `json:"resolver"`
-	Probes   []ProbeStatus `json:"probes"`
+	Node    string `json:"node"`
+	Version string `json:"version"`
+	Uptime  string `json:"uptime"`
+	Series  int    `json:"series"`
+	// ConfigSource is file, api or none; ConfigHash is the sha256 of the bytes
+	// behind it, and both are empty only before anything was applied.
+	ConfigSource    string        `json:"config_source"`
+	ConfigHash      string        `json:"config_hash,omitempty"`
+	ConfigAppliedAt string        `json:"config_applied_at,omitempty"`
+	Resolver        string        `json:"resolver"`
+	Probes          []ProbeStatus `json:"probes"`
 }
 
 // ProbeStatus is one probe after defaults, templates and discovery.
@@ -33,12 +56,19 @@ type ProbeStatus struct {
 // Status takes a snapshot of what the node is doing right now.
 func (a *App) Status() Status {
 	runners := a.Runners()
+	meta := a.ConfigMeta()
 	s := Status{
-		Node:     a.Cfg.Node.Name,
-		Uptime:   time.Since(started).Round(time.Second).String(),
-		Series:   a.Store.Len(),
-		Resolver: a.Cfg.Resolver.Mode,
-		Probes:   make([]ProbeStatus, 0, len(runners)),
+		Node:         a.Cfg.Node.Name,
+		Version:      VersionString(),
+		Uptime:       time.Since(started).Round(time.Second).String(),
+		Series:       a.Store.Len(),
+		ConfigSource: cmp.Or(meta.Source, SourceNone),
+		ConfigHash:   meta.Hash,
+		Resolver:     a.Cfg.Resolver.Mode,
+		Probes:       make([]ProbeStatus, 0, len(runners)),
+	}
+	if !meta.AppliedAt.IsZero() {
+		s.ConfigAppliedAt = meta.AppliedAt.UTC().Format(time.RFC3339)
 	}
 	for _, r := range runners {
 		targets := r.Source.Targets()

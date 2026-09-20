@@ -103,7 +103,6 @@ type Failure struct {
 	Message string
 }
 
-// failures maps each currently failing "target|backend" to what is wrong.
 func (h *health) failures() map[string]Failure {
 	h.mu.Lock()
 	defer h.mu.Unlock()

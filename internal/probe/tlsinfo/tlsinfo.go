@@ -25,6 +25,9 @@ type Options struct {
 	CACert             string `yaml:"ca_cert"`
 	ClientCert         string `yaml:"client_cert"`
 	ClientKey          string `yaml:"client_key"`
+	// CheckRevoked asks the OCSP responder whether the certificate still
+	// stands. An expiry date says nothing about a key that leaked last week.
+	CheckRevoked bool `yaml:"check_revoked"`
 }
 
 // Files lists the paths Build reads, so a reload can detect a rotated file.
@@ -128,7 +131,6 @@ func fingerprint(der []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Record turns a connection state into metrics.
 func Record(rec *metrics.Recorder, st *tls.ConnectionState, now time.Time) {
 	if st == nil {
 		return
@@ -136,8 +138,8 @@ func Record(rec *metrics.Recorder, st *tls.ConnectionState, now time.Time) {
 	rec.Gauge("tls_enabled", 1)
 	rec.Info("tls_version_info", versionName(st.Version))
 	rec.Info("tls_cipher_info", tls.CipherSuiteName(st.CipherSuite))
-	rec.Gauge("tls_handshake_resumed", boolValue(st.DidResume))
-	rec.Gauge("tls_ocsp_stapled", boolValue(len(st.OCSPResponse) > 0))
+	rec.Gauge("tls_handshake_resumed", metrics.Bool(st.DidResume))
+	rec.Gauge("tls_ocsp_stapled", metrics.Bool(len(st.OCSPResponse) > 0))
 	if st.NegotiatedProtocol != "" {
 		rec.Info("tls_alpn_info", st.NegotiatedProtocol)
 	}
@@ -150,7 +152,7 @@ func Record(rec *metrics.Recorder, st *tls.ConnectionState, now time.Time) {
 	rec.Gauge("tls_cert_not_after_seconds", float64(leaf.NotAfter.Unix()))
 	rec.Gauge("tls_cert_not_before_seconds", float64(leaf.NotBefore.Unix()))
 	rec.Gauge("tls_cert_expiry_days", leaf.NotAfter.Sub(now).Hours()/24)
-	rec.Gauge("tls_cert_valid", boolValue(now.After(leaf.NotBefore) && now.Before(leaf.NotAfter)))
+	rec.Gauge("tls_cert_valid", metrics.Bool(now.After(leaf.NotBefore) && now.Before(leaf.NotAfter)))
 	rec.Info("tls_cert_issuer_info", leaf.Issuer.CommonName)
 	rec.Info("tls_cert_subject_info", leaf.Subject.CommonName)
 	rec.Gauge("tls_cert_san_count", float64(len(leaf.DNSNames)))
@@ -165,6 +167,7 @@ func Record(rec *metrics.Recorder, st *tls.ConnectionState, now time.Time) {
 		}
 	}
 	rec.Gauge("tls_chain_expiry_days", earliest.Sub(now).Hours()/24)
+	rec.Gauge("tls_chain_not_after_seconds", float64(earliest.Unix()))
 }
 
 func versionName(v uint16) string {
@@ -179,11 +182,4 @@ func versionName(v uint16) string {
 		return "TLS1.3"
 	}
 	return fmt.Sprintf("0x%04x", v)
-}
-
-func boolValue(b bool) float64 {
-	if b {
-		return 1
-	}
-	return 0
 }
