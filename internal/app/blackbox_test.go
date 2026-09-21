@@ -2,15 +2,19 @@ package app
 
 import (
 	"testing"
+	"time"
 
 	"github.com/tonyamdfrost-cmd/Argus/internal/metrics"
 	"github.com/tonyamdfrost-cmd/Argus/internal/probe"
 )
 
+// aliasNow is 30 days before the certificate in the tests expires, at 1800000000.
+var aliasNow = time.Unix(1800000000-30*86400, 0)
+
 func aliasIndex(t *testing.T, native []metrics.Sample, regex bool) map[string]metrics.Sample {
 	t.Helper()
 	out := map[string]metrics.Sample{}
-	for _, s := range blackboxAliases(native, func(string) bool { return regex }) {
+	for _, s := range blackboxAliases(native, aliasNow, func(string) bool { return regex }) {
 		out[s.Name+s.Labels.Key()] = s
 	}
 	return out
@@ -31,7 +35,8 @@ func TestBlackboxAliasesTranslateTheSeriesBothMeasure(t *testing.T) {
 
 	native := []metrics.Sample{
 		{Name: "http_status_code", Labels: backend, Value: metrics.Gauge(200)},
-		{Name: "tls_chain_not_after_seconds", Labels: backend, Value: metrics.Gauge(1800000000)},
+		// Counted by a probe that ran a quarter of a second before aliasNow.
+		{Name: "tls_chain_expiry_days", Labels: backend, Value: metrics.Gauge((30*86400 + 0.25) / 86400)},
 		{Name: "tls_version_info", Labels: backend, Value: metrics.Info("TLS1.3")},
 		{Name: "http_proto_info", Labels: backend, Value: metrics.Info("HTTP/2.0")},
 		{Name: probe.SeriesUp, Labels: backend, Value: metrics.Gauge(1)},
@@ -100,7 +105,7 @@ func TestBlackboxAliasesLeaveApproximationsAlone(t *testing.T) {
 		{Name: "http_response_size_bytes", Labels: base, Value: metrics.Gauge(1024)},
 		{Name: "tls_cert_expiry_days", Labels: base, Value: metrics.Gauge(30)},
 	}
-	if got := blackboxAliases(native, func(string) bool { return false }); len(got) != 0 {
+	if got := blackboxAliases(native, aliasNow, func(string) bool { return false }); len(got) != 0 {
 		t.Errorf("aliased %d series that have no exact twin: %v", len(got), got)
 	}
 }

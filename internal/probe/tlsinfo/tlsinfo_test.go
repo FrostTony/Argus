@@ -82,9 +82,6 @@ func TestFingerprintIsTheSHA256OfTheCertificate(t *testing.T) {
 	if got := info(t, record(t, leaf), "tls_cert_fingerprint_info"); got != hex.EncodeToString(sum[:]) {
 		t.Fatalf("fingerprint = %q, want the SHA-256 of the DER", got)
 	}
-	if got := info(t, record(t, leaf), "tls_cert_serial_info"); got != "7" {
-		t.Fatalf("serial = %q, want 7 in hex", got)
-	}
 }
 
 func TestNoCertificateReportsNoFingerprint(t *testing.T) {

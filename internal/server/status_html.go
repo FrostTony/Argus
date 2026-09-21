@@ -831,7 +831,13 @@ function apply(){
   txt($("clock"), clock(state.time));
 }
 
+let polling = false;
+
 async function poll(){
+  // A tick that finds the last answer still coming skips: a slow node or link
+  // would otherwise get a new request every few seconds on top of the unfinished ones.
+  if (polling) return;
+  polling = true;
   try {
     const r = await fetch("/status/data", {cache: "no-store"});
     if (!r.ok) throw new Error(r.status);
@@ -841,6 +847,8 @@ async function poll(){
     apply();
   } catch (e) {
     misses++;
+  } finally {
+    polling = false;
   }
   $("live").firstChild.className = "dotlive" + (paused || misses ? " off" : "");
   $("live").title = misses ? "the node is not answering (" + misses + ")" : "live";

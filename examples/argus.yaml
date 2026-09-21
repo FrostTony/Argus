@@ -73,6 +73,11 @@ probing:
   # in argus_series_dropped rather than growing until the node runs out of memory.
   max_series: 500000
   latency_buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10]
+  # Phases (connect, tls, write, ttfb, transfer) are sum and count by default:
+  # their mean, two series per phase. true gives them latency_buckets as well,
+  # for percentiles, at one series per bound per phase per backend. A probe can
+  # set it for itself.
+  # phase_histograms: false
 
 surfacers:
   - type: prometheus

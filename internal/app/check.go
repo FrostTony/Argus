@@ -105,7 +105,7 @@ func (a *App) Samples(ctx context.Context, req CheckRequest) (Exposition, error)
 
 	exp := Exposition{Samples: out}
 	if a.Cfg.HTTP.API.ProbeAliases {
-		exp.Aliases = blackboxAliases(out, capture.regexFailed)
+		exp.Aliases = blackboxAliases(out, time.Now(), capture.regexFailed)
 	}
 	if trace != nil {
 		exp.Log = trace.lines()

@@ -1720,7 +1720,7 @@
     {
       "id": 13,
       "type": "timeseries",
-      "title": "Connection phases, p95",
+      "title": "Connection phases, mean",
       "description": "connect · tls · write · ttfb · transfer, from the connection trace.",
       "datasource": {
         "type": "prometheus",
@@ -1739,7 +1739,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (phase,le) (rate(${prefix}probe_phase_duration_seconds_bucket{node=~\"$node\",probe=~\"$probe\",probe_type=~\"$probe_type\",target=~\"$target\"}[$__rate_interval])))",
+          "expr": "sum by (phase) (rate(${prefix}probe_phase_duration_seconds_sum{node=~\"$node\",probe=~\"$probe\",probe_type=~\"$probe_type\",target=~\"$target\"}[$__rate_interval])) / sum by (phase) (rate(${prefix}probe_phase_duration_seconds_count{node=~\"$node\",probe=~\"$probe\",probe_type=~\"$probe_type\",target=~\"$target\"}[$__rate_interval]))",
           "legendFormat": "{{phase}}",
           "range": true,
           "instant": false,
@@ -3170,7 +3170,7 @@
         {
           "id": 25,
           "type": "timeseries",
-          "title": "Time to first byte, p95",
+          "title": "Time to first byte, mean",
           "description": "",
           "datasource": {
             "type": "prometheus",
@@ -3189,7 +3189,7 @@
                 "uid": "${datasource}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile(0.95, sum by (probe,target,le) (rate(${prefix}probe_phase_duration_seconds_bucket{node=~\"$node\",probe=~\"$probe\",probe_type=~\"$probe_type\",target=~\"$target\",phase=\"ttfb\"}[$__rate_interval])))",
+              "expr": "sum by (probe,target) (rate(${prefix}probe_phase_duration_seconds_sum{node=~\"$node\",probe=~\"$probe\",probe_type=~\"$probe_type\",target=~\"$target\",phase=\"ttfb\"}[$__rate_interval])) / sum by (probe,target) (rate(${prefix}probe_phase_duration_seconds_count{node=~\"$node\",probe=~\"$probe\",probe_type=~\"$probe_type\",target=~\"$target\",phase=\"ttfb\"}[$__rate_interval]))",
               "legendFormat": "{{probe}} / {{target}}",
               "range": true,
               "instant": false,
@@ -4082,7 +4082,7 @@
           },
           "gridPos": {
             "h": 4,
-            "w": 6,
+            "w": 8,
             "x": 0,
             "y": 72
           },
@@ -4152,8 +4152,8 @@
           },
           "gridPos": {
             "h": 4,
-            "w": 6,
-            "x": 6,
+            "w": 8,
+            "x": 8,
             "y": 72
           },
           "targets": [
@@ -4222,8 +4222,8 @@
           },
           "gridPos": {
             "h": 4,
-            "w": 6,
-            "x": 12,
+            "w": 8,
+            "x": 16,
             "y": 72
           },
           "targets": [
@@ -4234,73 +4234,6 @@
               },
               "editorMode": "code",
               "expr": "100 * avg(${prefix}tls_ocsp_stapled{node=~\"$node\",probe=~\"$probe\",probe_type=~\"$probe_type\",target=~\"$target\"})",
-              "legendFormat": "__auto",
-              "range": true,
-              "instant": false,
-              "refId": "A"
-            }
-          ],
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "thresholds"
-              },
-              "mappings": [],
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "text",
-                    "value": null
-                  }
-                ]
-              },
-              "unit": "percent",
-              "decimals": 1
-            },
-            "overrides": []
-          },
-          "options": {
-            "colorMode": "value",
-            "graphMode": "none",
-            "justifyMode": "auto",
-            "orientation": "auto",
-            "percentChangeColorMode": "standard",
-            "reduceOptions": {
-              "calcs": [
-                "lastNotNull"
-              ],
-              "fields": "",
-              "values": false
-            },
-            "showPercentChange": false,
-            "textMode": "auto",
-            "wideLayout": true
-          }
-        },
-        {
-          "id": 37,
-          "type": "stat",
-          "title": "Handshakes resumed",
-          "description": "",
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "gridPos": {
-            "h": 4,
-            "w": 6,
-            "x": 18,
-            "y": 72
-          },
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "${datasource}"
-              },
-              "editorMode": "code",
-              "expr": "100 * avg(${prefix}tls_handshake_resumed{node=~\"$node\",probe=~\"$probe\",probe_type=~\"$probe_type\",target=~\"$target\"})",
               "legendFormat": "__auto",
               "range": true,
               "instant": false,
@@ -4821,7 +4754,7 @@
         {
           "id": 39,
           "type": "timeseries",
-          "title": "TLS handshake, p95",
+          "title": "TLS handshake, mean",
           "description": "",
           "datasource": {
             "type": "prometheus",
@@ -4840,7 +4773,7 @@
                 "uid": "${datasource}"
               },
               "editorMode": "code",
-              "expr": "histogram_quantile(0.95, sum by (probe,target,le) (rate(${prefix}probe_phase_duration_seconds_bucket{node=~\"$node\",probe=~\"$probe\",probe_type=~\"$probe_type\",target=~\"$target\",phase=\"tls\"}[$__rate_interval])))",
+              "expr": "sum by (probe,target) (rate(${prefix}probe_phase_duration_seconds_sum{node=~\"$node\",probe=~\"$probe\",probe_type=~\"$probe_type\",target=~\"$target\",phase=\"tls\"}[$__rate_interval])) / sum by (probe,target) (rate(${prefix}probe_phase_duration_seconds_count{node=~\"$node\",probe=~\"$probe\",probe_type=~\"$probe_type\",target=~\"$target\",phase=\"tls\"}[$__rate_interval]))",
               "legendFormat": "{{probe}} / {{target}}",
               "range": true,
               "instant": false,

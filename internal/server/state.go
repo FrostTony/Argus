@@ -69,12 +69,13 @@ type backendData struct {
 	Hist     map[string]histData `json:"hist,omitempty"`
 }
 
-// histData is a histogram summarised without its buckets.
+// histData is a histogram summarised without its buckets; a bucketless one
+// has no percentiles to give.
 type histData struct {
 	Count uint64  `json:"count"`
 	Mean  float64 `json:"mean"`
-	P50   float64 `json:"p50"`
-	P95   float64 `json:"p95"`
+	P50   float64 `json:"p50,omitempty"`
+	P95   float64 `json:"p95,omitempty"`
 }
 
 // Series the page reads by name, each driving a field of its own.
@@ -272,9 +273,11 @@ func absorb(bd *backendData, sm metrics.Sample) {
 		if r := sm.Labels.Get("resolver"); r != "" {
 			name += ":" + r
 		}
-		bd.Hist[name] = histData{
-			Count: v.Count, Mean: v.Mean(), P50: v.Quantile(0.5), P95: v.Quantile(0.95),
+		h := histData{Count: v.Count, Mean: v.Mean()}
+		if v.HasBuckets() {
+			h.P50, h.P95 = v.Quantile(0.5), v.Quantile(0.95)
 		}
+		bd.Hist[name] = h
 	}
 }
 

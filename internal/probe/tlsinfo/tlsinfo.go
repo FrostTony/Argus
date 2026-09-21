@@ -135,10 +135,8 @@ func Record(rec *metrics.Recorder, st *tls.ConnectionState, now time.Time) {
 	if st == nil {
 		return
 	}
-	rec.Gauge("tls_enabled", 1)
 	rec.Info("tls_version_info", versionName(st.Version))
 	rec.Info("tls_cipher_info", tls.CipherSuiteName(st.CipherSuite))
-	rec.Gauge("tls_handshake_resumed", metrics.Bool(st.DidResume))
 	rec.Gauge("tls_ocsp_stapled", metrics.Bool(len(st.OCSPResponse) > 0))
 	if st.NegotiatedProtocol != "" {
 		rec.Info("tls_alpn_info", st.NegotiatedProtocol)
@@ -149,15 +147,12 @@ func Record(rec *metrics.Recorder, st *tls.ConnectionState, now time.Time) {
 		return
 	}
 	leaf := st.PeerCertificates[0]
-	rec.Gauge("tls_cert_not_after_seconds", float64(leaf.NotAfter.Unix()))
-	rec.Gauge("tls_cert_not_before_seconds", float64(leaf.NotBefore.Unix()))
 	rec.Gauge("tls_cert_expiry_days", leaf.NotAfter.Sub(now).Hours()/24)
 	rec.Gauge("tls_cert_valid", metrics.Bool(now.After(leaf.NotBefore) && now.Before(leaf.NotAfter)))
 	rec.Info("tls_cert_issuer_info", leaf.Issuer.CommonName)
 	rec.Info("tls_cert_subject_info", leaf.Subject.CommonName)
 	rec.Gauge("tls_cert_san_count", float64(len(leaf.DNSNames)))
 	rec.Info("tls_cert_fingerprint_info", fingerprint(leaf.Raw))
-	rec.Info("tls_cert_serial_info", leaf.SerialNumber.Text(16))
 
 	// An intermediate expires independently of the leaf and breaks the chain.
 	earliest := leaf.NotAfter
@@ -167,7 +162,6 @@ func Record(rec *metrics.Recorder, st *tls.ConnectionState, now time.Time) {
 		}
 	}
 	rec.Gauge("tls_chain_expiry_days", earliest.Sub(now).Hours()/24)
-	rec.Gauge("tls_chain_not_after_seconds", float64(earliest.Unix()))
 }
 
 func versionName(v uint16) string {

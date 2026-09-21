@@ -282,6 +282,10 @@ func (a *App) buildRunner(pc config.Probe, nodeLabels metrics.Labels) (*probe.Ru
 	if len(pc.LatencyBuckets) > 0 {
 		buckets = metrics.Buckets(pc.LatencyBuckets)
 	}
+	var phaseBuckets metrics.Buckets
+	if config.Enabled(pc.PhaseHistograms, a.Cfg.Probing.PhaseHistograms) {
+		phaseBuckets = buckets
+	}
 	labels := nodeLabels.Merge(labelsOf(pc.Labels)).With("probe_type", pc.Type)
 	if err := metrics.ValidateLabels(labels.With("probe", pc.Name)); err != nil {
 		return nil, fmt.Errorf("probe %q: %w", pc.Name, err)
@@ -306,26 +310,27 @@ func (a *App) buildRunner(pc config.Probe, nodeLabels metrics.Labels) (*probe.Ru
 	}
 
 	return &probe.Runner{
-		Name:        pc.Name,
-		Kind:        pc.Type,
-		Prober:      prober,
-		Source:      source,
-		Interval:    interval,
-		Timeout:     timeout,
-		Labels:      labels,
-		Buckets:     buckets,
-		Resolver:    a.resolver,
-		Family:      family,
-		Fallback:    config.Enabled(pc.IPFallback, false),
-		SourceIP:    sourceIP,
-		Schedule:    schedule,
-		Negative:    config.Enabled(pc.NegativeTest, false),
-		Requests:    pc.RequestsPerProbe,
-		Hostname:    pc.Hostname,
-		MaxBackends: a.Cfg.Resolver.MaxBackends,
-		PerBackend:  config.Enabled(pc.PerBackend, a.Cfg.Probing.PerBackend),
-		Sem:         a.sem,
-		Log:         a.Log,
+		Name:         pc.Name,
+		Kind:         pc.Type,
+		Prober:       prober,
+		Source:       source,
+		Interval:     interval,
+		Timeout:      timeout,
+		Labels:       labels,
+		Buckets:      buckets,
+		PhaseBuckets: phaseBuckets,
+		Resolver:     a.resolver,
+		Family:       family,
+		Fallback:     config.Enabled(pc.IPFallback, false),
+		SourceIP:     sourceIP,
+		Schedule:     schedule,
+		Negative:     config.Enabled(pc.NegativeTest, false),
+		Requests:     pc.RequestsPerProbe,
+		Hostname:     pc.Hostname,
+		MaxBackends:  a.Cfg.Resolver.MaxBackends,
+		PerBackend:   config.Enabled(pc.PerBackend, a.Cfg.Probing.PerBackend),
+		Sem:          a.sem,
+		Log:          a.Log,
 	}, nil
 }
 

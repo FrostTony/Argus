@@ -49,13 +49,13 @@ func New(a *app.App, files Files) (*http.Server, error) {
 		Prefix:     exposition.Prefix,
 		Timestamps: exposition.IncludeTimestamps,
 	}
-	mux.HandleFunc(a.Cfg.HTTP.MetricsPath, func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc(a.Cfg.HTTP.MetricsPath, compressed(func(w http.ResponseWriter, _ *http.Request) {
 		a.RefreshSelf()
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		bw := bufio.NewWriterSize(w, 64<<10)
 		_, _ = prom.WriteTo(bw)
 		_ = bw.Flush()
-	})
+	}))
 
 	mux.HandleFunc("/logo.png", serveLogo)
 
@@ -63,17 +63,17 @@ func New(a *app.App, files Files) (*http.Server, error) {
 		_, _ = w.Write([]byte("ok\n"))
 	})
 
-	mux.HandleFunc("/status.json", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/status.json", compressed(func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, a.Status())
-	})
+	}))
 
 	page, err := newStatusPage(a)
 	if err != nil {
 		return nil, err
 	}
-	mux.HandleFunc("/", page.handle)
-	mux.HandleFunc("/status", page.handle)
-	mux.HandleFunc("/status/data", page.data)
+	mux.HandleFunc("/", compressed(page.handle))
+	mux.HandleFunc("/status", compressed(page.handle))
+	mux.HandleFunc("/status/data", compressed(page.data))
 
 	if cfg := a.Cfg.HTTP.API; cfg.Enabled {
 		api := &api{app: a, files: files, cfg: cfg, timeout: a.Cfg.HTTP.Timeout.D()}

@@ -43,6 +43,8 @@ type Probe struct {
 	Labels         map[string]string `yaml:"labels,omitempty"`
 	Targets        Targets           `yaml:"targets,omitempty"`
 	LatencyBuckets []float64         `yaml:"latency_buckets,omitempty"`
+	// PhaseHistograms overrides the node's probing.phase_histograms.
+	PhaseHistograms *bool `yaml:"phase_histograms,omitempty"`
 
 	// IPVersion overrides the node's address family for this probe.
 	IPVersion string `yaml:"ip_version,omitempty"`
@@ -422,6 +424,7 @@ func (p Probe) mergeFrom(other Probe) Probe {
 	if len(other.LatencyBuckets) > 0 {
 		res.LatencyBuckets = other.LatencyBuckets
 	}
+	res.PhaseHistograms = pick(other.PhaseHistograms, p.PhaseHistograms)
 	if !other.Options.IsZero() {
 		res.Options = other.Options
 	}

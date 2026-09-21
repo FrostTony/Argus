@@ -95,8 +95,10 @@ func ExponentialBuckets(start, factor float64, n int) Buckets {
 	return b
 }
 
-// DefaultLatencyBuckets spans 1ms to ~32s.
-var DefaultLatencyBuckets = ExponentialBuckets(0.001, 2, 16)
+// DefaultLatencyBuckets spans 10ms to 10s, the default probe timeout, in the
+// 1-2.5-5 steps a latency graph is read in. Every bound is a series on every
+// backend, so they are few: a finer view is latency_buckets away.
+var DefaultLatencyBuckets = Buckets{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 
 // Observation is a single measurement waiting to be folded into a histogram.
 type Observation struct {

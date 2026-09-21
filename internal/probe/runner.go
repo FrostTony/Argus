@@ -38,6 +38,8 @@ type Runner struct {
 	Timeout  time.Duration
 	Labels   metrics.Labels
 	Buckets  metrics.Buckets
+	// PhaseBuckets are the phases' bounds; none keeps only sum and count.
+	PhaseBuckets metrics.Buckets
 
 	Resolver    resolve.Resolver
 	Family      resolve.Family
@@ -295,11 +297,7 @@ func (r *Runner) plan(ctx context.Context, tr *targetRun) []unit {
 			labels = labels.With("backend", b.String()).With("family", b.Family())
 		}
 		// A recorder per backend: Recorder is not safe for concurrent writes.
-		br := metrics.NewRecorder(labels)
-		if b.Valid() {
-			br.Info(SeriesBackendInfo, b.Addr.String())
-		}
-		out = append(out, unit{run: tr, backend: b, rec: br})
+		out = append(out, unit{run: tr, backend: b, rec: metrics.NewRecorder(labels)})
 	}
 	return out
 }
@@ -519,7 +517,7 @@ func (r *Runner) attempt(ctx context.Context, req Request, rec *metrics.Recorder
 	rec.Count(SeriesTotal, 1)
 	rec.Duration(TimeProbe, r.Buckets, elapsed)
 	for _, ph := range res.Phases {
-		rec.Duration(TimePhase, r.Buckets, ph.D, "phase", ph.Name)
+		rec.Duration(TimePhase, r.PhaseBuckets, ph.D, "phase", ph.Name)
 	}
 	if r.Negative {
 		res.Err = invert(res.Err)

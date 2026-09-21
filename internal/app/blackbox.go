@@ -1,8 +1,10 @@
 package app
 
 import (
+	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/tonyamdfrost-cmd/Argus/internal/metrics"
 	"github.com/tonyamdfrost-cmd/Argus/internal/probe"
@@ -21,7 +23,6 @@ var blackboxRenames = map[string]string{
 	"http_status_code":              "probe_http_status_code",
 	"http_content_length":           "probe_http_content_length",
 	"http_redirects":                "probe_http_redirects",
-	"tls_chain_not_after_seconds":   "probe_ssl_earliest_cert_expiry",
 	"resolve_last_duration_seconds": "probe_dns_lookup_time_seconds",
 	// blackbox publishes the duration as a gauge; the Argus series under that
 	// name is a histogram, so the gauge beside it is what carries over.
@@ -47,7 +48,7 @@ var phaseSeries = map[string]string{
 }
 
 // blackboxAliases returns the extra samples, given the run's native ones.
-func blackboxAliases(native []metrics.Sample, regexFailed func(target string) bool) []metrics.Sample {
+func blackboxAliases(native []metrics.Sample, now time.Time, regexFailed func(target string) bool) []metrics.Sample {
 	out := make([]metrics.Sample, 0, len(native)/4)
 	for _, s := range native {
 		switch {
@@ -63,6 +64,17 @@ func blackboxAliases(native []metrics.Sample, regexFailed func(target string) bo
 		case s.Name == probe.TimePhase.Last():
 			if alias, ok := phaseAlias(s); ok {
 				out = append(out, alias)
+			}
+
+		case s.Name == "tls_chain_expiry_days":
+			// blackbox has the date itself. The days left were counted moments
+			// ago from a whole-second notAfter, so the date comes back exact.
+			if days, ok := s.Value.(metrics.Gauge); ok {
+				out = append(out, metrics.Sample{
+					Name:   "probe_ssl_earliest_cert_expiry",
+					Labels: s.Labels,
+					Value:  metrics.Gauge(expiryDate(now, float64(days))),
+				})
 			}
 
 		case s.Name == "http_proto_info":
@@ -130,6 +142,11 @@ func spacedTLS(v string) string {
 		return "TLS " + rest
 	}
 	return v
+}
+
+// expiryDate turns days left at now into a unix timestamp, to the second.
+func expiryDate(now time.Time, days float64) float64 {
+	return math.Round(float64(now.UnixMilli())/1e3 + days*86400)
 }
 
 func text(v metrics.Value) string {

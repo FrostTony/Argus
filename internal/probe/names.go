@@ -10,7 +10,6 @@ const (
 	SeriesUp              = "probe_up"
 	SeriesBackends        = "target_backends"
 	SeriesBackendsUp      = "target_backends_up"
-	SeriesBackendInfo     = "target_backend_info"
 	SeriesResolveTotal    = "resolve_total"
 	SeriesResolveFail     = "resolve_failure_total"
 	SeriesResolveTTL      = "resolve_ttl_seconds"

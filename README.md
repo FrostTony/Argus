@@ -232,13 +232,12 @@ belongs to one address also carries `backend` and `family`.
 | `probe_failure_total{reason}` | attempts that failed, by class | +1 with `reason` one of `dns`, `connect`, `tls`, `timeout`, `status`, `content`, `protocol`, `internal`, `unknown` |
 | `probe_duration_seconds` | run latency, as a histogram | the prober's own time; name resolution excluded |
 | `probe_last_duration_seconds` | the latest run's latency | the same measurement as a gauge |
-| `probe_phase_duration_seconds{phase}` | latency split by phase, as a histogram | `connect`, `tls`, `write`, `ttfb`, `transfer`, from the connection trace |
+| `probe_phase_duration_seconds{phase}` | latency split by phase: sum and count (the mean); a histogram with `phase_histograms: true` | `connect`, `tls`, `write`, `ttfb`, `transfer`, from the connection trace |
 | `probe_phase_last_duration_seconds{phase}` | the latest phase timings | the same as a gauge |
 | `probe_timeout_seconds` | the deadline one request runs under | the probe's effective `timeout`, so a latency graph shows its ceiling |
 | `probe_expect_info{…}` | what a pattern matched | one label per **named** capture group in an `expect`, `body_regex`, `header_regex` or `answer_regex`; no named groups, no series. A group named after an identity label (`target`, `backend`, `probe`, …) is dropped: the value is the server's text |
 | `target_backends` | addresses the target resolved to | count of the answer, capped by `resolver.max_backends` |
 | `target_backends_up` | how many of them answered | count of backends whose run passed |
-| `target_backend_info{val}` | which addresses those are | one series per address, the address in `val` |
 | `resolve_total`, `resolve_failure_total{server}` | resolutions performed and failed | +1 per real lookup; cache hits are not counted |
 | `resolve_duration_seconds{server}`, `resolve_last_duration_seconds` | how long resolution took | measured around the lookup, cache hits excluded |
 | `resolve_ttl_seconds` | TTL of the answer the backends came from | smallest TTL in the response, clamped by `min_ttl`/`max_ttl` |
@@ -275,20 +274,16 @@ and by a `tcp` probe that upgrades with `starttls`.
 |---|---|---|
 | `tls_cert_expiry_days` | life left in the leaf certificate | `notAfter` minus now, in days; negative once expired |
 | `tls_chain_expiry_days` | life left in the weakest link | the same for the first certificate in the chain to expire, so an expiring intermediate is visible |
-| `tls_chain_not_after_seconds` | when that link expires | the same date as a unix timestamp |
 | `tls_cert_valid` | whether it is usable right now | 1 when the chain verifies against the configured name and the clock |
-| `tls_cert_not_after_seconds`, `tls_cert_not_before_seconds` | the validity window | the certificate's own timestamps |
 | `tls_chain_length` | certificates the server sent | length of the presented chain |
 | `tls_cert_san_count` | names the certificate covers | number of SAN entries |
 | `tls_ocsp_stapled` | whether revocation came with the handshake | 1 when the server stapled a response |
 | `tls_cert_revoked` | whether the certificate still stands | with `check_revoked: true`, 1 when the responder says it was revoked — and the check fails |
 | `tls_ocsp_status_info{val}` | what the responder said | `good`, `revoked`, `unknown`, or `unavailable` when it could not be asked |
 | `tls_ocsp_next_update_seconds` | how current that answer is | the responder's `nextUpdate`, as a unix timestamp |
-| `tls_handshake_resumed` | whether the session was resumed | 1 on a resumed handshake |
 | `tls_cert_fingerprint_info{val}` | the exact certificate | SHA-256 of the leaf, so a change is a diff rather than a guess |
-| `tls_cert_serial_info{val}`, `tls_cert_issuer_info{val}`, `tls_cert_subject_info{val}` | who issued it and to whom | fields of the leaf, as labels |
+| `tls_cert_issuer_info{val}`, `tls_cert_subject_info{val}` | who issued it and to whom | fields of the leaf, as labels |
 | `tls_version_info{val}`, `tls_cipher_info{val}`, `tls_alpn_info{val}` | what was negotiated | `TLS 1.3`, the cipher suite, the ALPN protocol |
-| `tls_enabled` | whether TLS was used at all | 1 or 0 |
 
 ### `dns`
 

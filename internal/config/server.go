@@ -117,6 +117,10 @@ type Probing struct {
 	// MaxSeries caps the metric store; new series past it are dropped and counted.
 	MaxSeries      int       `yaml:"max_series"`
 	LatencyBuckets []float64 `yaml:"latency_buckets"`
+	// PhaseHistograms gives the phases (connect, tls, ttfb...) the latency
+	// buckets too. Off, a phase is its sum and count: the mean, two series
+	// instead of one per bound on every backend.
+	PhaseHistograms bool `yaml:"phase_histograms"`
 	// WatchConfig re-reads the check files on this interval and reloads on a
 	// change. Zero, the default, leaves SIGHUP and the API as the only ways in.
 	WatchConfig Duration `yaml:"watch_config"`
