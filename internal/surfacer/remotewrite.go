@@ -250,24 +250,25 @@ func expand(samples []metrics.Sample, prefix string, ts int64, value func(float6
 		les:    make(map[float64]string),
 	}
 	for _, s := range samples {
+		l := validLabels(s.Labels)
 		switch v := s.Value.(type) {
 		case metrics.Counter:
-			f.add(s.Name, "", s.Labels, metrics.Label{}, float64(v))
+			f.add(s.Name, "", l, metrics.Label{}, float64(v))
 		case metrics.Gauge:
-			f.add(s.Name, "", s.Labels, metrics.Label{}, float64(v))
+			f.add(s.Name, "", l, metrics.Label{}, float64(v))
 		case metrics.Info:
-			f.add(s.Name, "", s.Labels, metrics.Label{Name: "val", Value: string(v)}, 1)
+			f.add(s.Name, "", l, metrics.Label{Name: "val", Value: validUTF8(string(v))}, 1)
 		case *metrics.Dist:
 			if v.HasBuckets() {
 				var cum uint64
 				for i, b := range v.Buckets {
 					cum += v.Counts[i]
-					f.add(s.Name, "_bucket", s.Labels, metrics.Label{Name: "le", Value: f.le(b)}, float64(cum))
+					f.add(s.Name, "_bucket", l, metrics.Label{Name: "le", Value: f.le(b)}, float64(cum))
 				}
-				f.add(s.Name, "_bucket", s.Labels, metrics.Label{Name: "le", Value: "+Inf"}, float64(v.Count))
+				f.add(s.Name, "_bucket", l, metrics.Label{Name: "le", Value: "+Inf"}, float64(v.Count))
 			}
-			f.add(s.Name, "_sum", s.Labels, metrics.Label{}, v.Sum)
-			f.add(s.Name, "_count", s.Labels, metrics.Label{}, float64(v.Count))
+			f.add(s.Name, "_sum", l, metrics.Label{}, v.Sum)
+			f.add(s.Name, "_count", l, metrics.Label{}, float64(v.Count))
 		}
 	}
 	return f.out
@@ -305,7 +306,8 @@ func (f *flattener) name(base, suffix string) string {
 	if s, ok := f.names[k]; ok {
 		return s
 	}
-	s := metrics.Prefixed(f.prefix, base) + suffix
+	// Unlike the exposition, remote-write sends a name without vetting it.
+	s := validUTF8(metrics.Prefixed(f.prefix, base) + suffix)
 	f.names[k] = s
 	return s
 }

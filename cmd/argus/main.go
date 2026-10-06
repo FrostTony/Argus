@@ -104,12 +104,11 @@ type flags struct {
 	format string
 }
 
-// checks is the check configuration the node starts with, plus where it came
-// from: the same two facts /status reports.
+// checks is a check configuration plus where it came from: what /status and
+// the API report about it.
 type checks struct {
 	probes config.Probes
-	source string
-	hash   string
+	meta   app.ConfigMeta
 }
 
 type multiFlag []string
@@ -150,7 +149,7 @@ func load(f *flags) (config.Server, checks, *slog.Logger, error) {
 	if err != nil {
 		return srv, checks{}, nil, err
 	}
-	ck, err := loadChecks(f, log)
+	ck, err := loadChecks(f, log, true)
 	return srv, ck, log, err
 }
 
@@ -158,43 +157,52 @@ func load(f *flags) (config.Server, checks, *slog.Logger, error) {
 // node was told to run, and the files are only the fallback. A state file that
 // cannot be used is reported and left on disk as evidence - refusing to start
 // would take the node down over a file the operator never wrote.
-func loadChecks(f *flags, log *slog.Logger) (checks, error) {
+//
+// With nothing usable a node starts empty and waits for a push. A reload in the
+// same position fails instead: replacing a running configuration with nothing
+// would stop every probe over a typo.
+func loadChecks(f *flags, log *slog.Logger, startup bool) (checks, error) {
+	var stateErr error
 	if f.state != "" {
 		data, err := os.ReadFile(f.state)
 		switch {
 		case err == nil && len(bytes.TrimSpace(data)) > 0:
 			probes, perr := config.ParseProbes(data)
 			if perr == nil {
-				return checks{probes: probes, source: app.SourceAPI, hash: config.Hash(data)}, nil
+				meta := app.ConfigMeta{Source: app.SourceAPI, Hash: config.Hash(data), Document: data}
+				return checks{probes: probes, meta: meta}, nil
 			}
+			stateErr = fmt.Errorf("%s: %w", f.state, perr)
 			log.Error("the saved configuration is unusable, falling back to the files",
 				"path", f.state, "err", perr)
 		case err != nil && !errors.Is(err, fs.ErrNotExist):
+			stateErr = err
 			log.Error("cannot read the saved configuration, falling back to the files",
 				"path", f.state, "err", err)
 		}
 	}
+	none := checks{meta: app.ConfigMeta{Source: app.SourceNone}}
 	if len(f.probes) == 0 {
+		if stateErr != nil && !startup {
+			return checks{}, stateErr
+		}
 		// A node that has never been pushed to checks nothing until it is.
-		return checks{source: app.SourceNone}, nil
+		return none, nil
 	}
-	probes, err := config.LoadProbes(f.probes...)
+	files, err := config.LoadFiles(f.probes...)
 	if err != nil {
 		// With a state file the files are only a fallback, and a node waiting
 		// for its first push must not crash-loop over a directory nobody filled.
-		if f.state == "" {
+		if f.state == "" || !startup {
 			return checks{}, err
 		}
 		log.Error("no usable check files, waiting for a configuration through the API", "err", err)
-		return checks{source: app.SourceNone}, nil
+		return none, nil
 	}
 	// Files hash differently from a pushed document, so a backend comparing
 	// hashes sees a mismatch and pushes once. That is the intended answer.
-	hash, err := config.Fingerprint(f.probes...)
-	if err != nil {
-		return checks{}, err
-	}
-	return checks{probes: probes, source: app.SourceFile, hash: hash}, nil
+	meta := app.ConfigMeta{Source: app.SourceFile, Hash: files.Fingerprint, Document: files.Document}
+	return checks{probes: files.Probes, meta: meta}, nil
 }
 
 func newLogger(c config.Server) (*slog.Logger, error) {
@@ -224,28 +232,21 @@ func cmdRun(args []string) error {
 		return err
 	}
 	defer a.Close()
-	a.SetConfigMeta(ck.source, ck.hash)
-
-	// Reloading re-reads the same sources, state file included, so SIGHUP and
-	// the API behave alike.
-	reload := func() error {
-		next, err := loadChecks(f, log)
-		if err != nil {
-			return err
-		}
-		if err := a.Reload(next.probes); err != nil {
-			return err
-		}
-		a.SetConfigMeta(next.source, next.hash)
-		return nil
-	}
+	a.SetConfigMeta(ck.meta)
+	reload := reloader(f, a, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	go watchHUP(ctx, a, reload, log)
 	// Nothing to watch when the checks come from the API alone.
 	if every := srvCfg.Probing.WatchConfig.D(); every > 0 && len(f.probes) > 0 {
-		go watchFiles(ctx, f.probes, every, reload, log)
+		// Measured from what was loaded, so a change made while the node was
+		// still starting counts as one.
+		var loaded string
+		if ck.meta.Source == app.SourceFile {
+			loaded = ck.meta.Hash
+		}
+		go watchFiles(ctx, f.probes, loaded, every, reload, log)
 	}
 
 	files := server.Files{Reload: reload, Persist: persister(f)}
@@ -268,7 +269,7 @@ func cmdRun(args []string) error {
 
 	log.Info("argus started",
 		"probes", len(a.Runners()),
-		"config_source", ck.source,
+		"config_source", ck.meta.Source,
 		"targets", countTargets(a),
 		"listen", srvCfg.HTTP.Listen,
 		"tls", srvCfg.HTTP.TLS != nil,
@@ -281,6 +282,18 @@ func cmdRun(args []string) error {
 	a.Start(ctx)
 	log.Info("argus stopped", "uptime", a.Status().Uptime)
 	return <-errc
+}
+
+// reloader re-reads the sources the node started from, state file included, so
+// SIGHUP, the file watcher and the API reload alike.
+func reloader(f *flags, a *app.App, log *slog.Logger) func() error {
+	return func() error {
+		next, err := loadChecks(f, log, false)
+		if err != nil {
+			return err
+		}
+		return a.Replace(next.probes, next.meta, nil)
+	}
 }
 
 // persister decides where a configuration accepted through the API is written:
@@ -319,11 +332,15 @@ func countTargets(a *app.App) int {
 }
 
 // watchFiles reloads when the check files change on disk. Off unless asked for.
-func watchFiles(ctx context.Context, paths []string, every time.Duration, reload func() error, log *slog.Logger) {
-	applied, err := config.Fingerprint(paths...)
-	if err != nil {
-		log.Error("cannot watch the check files", "err", err)
-		return
+// applied is the fingerprint of the files the running configuration was read
+// from; empty when it was not read from them, and then they are taken as found.
+func watchFiles(ctx context.Context, paths []string, applied string, every time.Duration, reload func() error, log *slog.Logger) {
+	if applied == "" {
+		var err error
+		if applied, err = config.Fingerprint(paths...); err != nil {
+			log.Error("cannot watch the check files", "err", err)
+			return
+		}
 	}
 	seen := applied
 

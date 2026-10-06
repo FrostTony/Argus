@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -77,7 +78,7 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 		res.Err = err
 		return res
 	}
-	authority := cmp.Or(p.cfg.Authority, req.ServerName(), addr)
+	authority := cmp.Or(p.cfg.Authority, uriHost(req.ServerName()), addr)
 
 	// Recorder is not safe for concurrent writes, and the dial callback runs on a
 	// transport-owned goroutine, so state is recorded after RoundTrip returns.
@@ -261,5 +262,13 @@ func hostOf(authority string) string {
 	if host, _, err := net.SplitHostPort(authority); err == nil {
 		return host
 	}
-	return authority
+	return strings.TrimSuffix(strings.TrimPrefix(authority, "["), "]")
+}
+
+// uriHost brackets an IPv6 literal, as an authority requires.
+func uriHost(host string) string {
+	if strings.Contains(host, ":") {
+		return "[" + host + "]"
+	}
+	return host
 }

@@ -27,7 +27,7 @@ func LoadServer(path string) (Server, error) {
 		if err != nil {
 			return cfg, fmt.Errorf("server config: %w", err)
 		}
-		if err := decodeStrictBytes(expandEnv(data), &cfg); err != nil {
+		if err := decodeDocument(data, &cfg); err != nil {
 			return cfg, fmt.Errorf("%s: %w", path, err)
 		}
 	}
@@ -39,28 +39,68 @@ func LoadServer(path string) (Server, error) {
 
 // LoadProbes reads files and directories of *.yaml/*.yml as one configuration.
 func LoadProbes(paths ...string) (Probes, error) {
-	var merged Probes
+	f, err := LoadFiles(paths...)
+	return f.Probes, err
+}
+
+// Files is a check configuration read from disk, with what identifies it.
+type Files struct {
+	Probes Probes
+	// Document is the text read, ${VAR} references as written: a single file as
+	// it is, several as a YAML stream with a document per file.
+	Document []byte
+	// Fingerprint is what Fingerprint returns for the same files.
+	Fingerprint string
+}
+
+// LoadFiles is LoadProbes plus the text and the fingerprint of what it read,
+// all three taken from the same read of each file.
+func LoadFiles(paths ...string) (Files, error) {
+	var out Files
 	files, err := expandPaths(paths)
 	if err != nil {
-		return merged, err
+		return out, err
 	}
 	if len(files) == 0 {
-		return merged, fmt.Errorf("check config: no files found")
+		return out, fmt.Errorf("check config: no files found")
 	}
+	sum := sha256.New()
+	texts := make([][]byte, 0, len(files))
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
-			return merged, fmt.Errorf("check config: %w", err)
+			return out, fmt.Errorf("check config: %w", err)
 		}
+		stamp(sum, f, data)
+		texts = append(texts, data)
+
 		var p Probes
-		if err := decodeStrictBytes(expandEnv(data), &p); err != nil {
-			return merged, fmt.Errorf("%s: %w", f, err)
+		if err := decodeDocument(data, &p); err != nil {
+			return out, fmt.Errorf("%s: %w", f, err)
 		}
-		if err := merged.absorb(p, f); err != nil {
-			return merged, err
+		if err := out.Probes.absorb(p, f); err != nil {
+			return out, err
 		}
 	}
-	return merged, nil
+	out.Document = document(files, texts)
+	out.Fingerprint = hex.EncodeToString(sum.Sum(nil))
+	return out, nil
+}
+
+// document joins files into one text: a single file stays as it is, several
+// become a YAML stream with a document per file, headed by its name.
+func document(names []string, texts [][]byte) []byte {
+	if len(texts) == 1 {
+		return texts[0]
+	}
+	var b bytes.Buffer
+	for i, text := range texts {
+		fmt.Fprintf(&b, "--- # %s\n%s", names[i], text)
+		if !bytes.HasSuffix(text, []byte("\n")) {
+			b.WriteByte('\n')
+		}
+	}
+	return b.Bytes()
 }
 
 // absorb folds one file into the whole: a later file's defaults override an
@@ -136,10 +176,15 @@ func Fingerprint(paths ...string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("check config: %w", err)
 		}
-		fmt.Fprintf(sum, "%s\x00%d\x00", f, len(data))
-		sum.Write(data)
+		stamp(sum, f, data)
 	}
 	return hex.EncodeToString(sum.Sum(nil)), nil
+}
+
+// stamp adds one file to a fingerprint: its name, its length and its content.
+func stamp(w io.Writer, name string, data []byte) {
+	fmt.Fprintf(w, "%s\x00%d\x00", name, len(data))
+	w.Write(data)
 }
 
 func expandPaths(paths []string) ([]string, error) {
@@ -173,7 +218,7 @@ func expandPaths(paths []string) ([]string, error) {
 // ${VAR} expansion included, so the same bytes mean the same thing either way.
 func ParseProbes(data []byte) (Probes, error) {
 	var p Probes
-	if err := decodeStrictBytes(expandEnv(data), &p); err != nil {
+	if err := decodeDocument(data, &p); err != nil {
 		return p, err
 	}
 	if _, err := p.Resolve(); err != nil {
@@ -185,10 +230,39 @@ func ParseProbes(data []byte) (Probes, error) {
 // ParseProbe reads a single probe definition, for the ad-hoc check API.
 func ParseProbe(data []byte) (Probe, error) {
 	var p Probe
-	if err := decodeStrictBytes(expandEnv(data), &p); err != nil {
+	if err := decodeDocument(data, &p); err != nil {
 		return p, err
 	}
 	return p, p.validate()
+}
+
+// decodeDocument reads a configuration strictly. ${VAR} is expanded inside the
+// parsed scalars, so a value may hold any character without changing the
+// structure around it, and error lines still point into the text as written.
+func decodeDocument(data []byte, dst any) error {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	var doc yaml.Node
+	if err := dec.Decode(&doc); err != nil {
+		if err == io.EOF {
+			return nil
+		}
+		return err
+	}
+	// A second document would be silently ignored, and with it whatever it says.
+	var next yaml.Node
+	if err := dec.Decode(&next); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		if len(next.Content) > 0 && next.Content[0].ShortTag() != "!!null" {
+			return fmt.Errorf("line %d: a configuration is a single YAML document", next.Line)
+		}
+	}
+	expandEnv(&doc)
+	if err := knownFields(&doc, reflect.TypeOf(dst)); err != nil {
+		return err
+	}
+	return doc.Decode(dst)
 }
 
 func decodeStrictBytes(data []byte, dst any) error {
@@ -287,15 +361,26 @@ func mergeKeys(pairs []*yaml.Node) []*yaml.Node {
 // envRef matches only ${VAR}: a bare $ is an anchor in the regexes configs carry.
 var envRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
-// expandEnv substitutes ${VAR}; an unknown name is left as text.
-func expandEnv(data []byte) []byte {
-	return envRef.ReplaceAllFunc(data, func(m []byte) []byte {
-		name := string(m[2 : len(m)-1])
-		if v, ok := os.LookupEnv(name); ok {
-			return []byte(v)
+// expandEnv substitutes ${VAR} in every scalar; an unknown name is left as text.
+func expandEnv(n *yaml.Node) {
+	if n.Kind == yaml.ScalarNode {
+		v := envRef.ReplaceAllStringFunc(n.Value, func(ref string) string {
+			if v, ok := os.LookupEnv(ref[2 : len(ref)-1]); ok {
+				return v
+			}
+			return ref
+		})
+		if v != n.Value {
+			n.Value = v
+			// A plain scalar is typed by its text, and the text is new: 8080 is a number.
+			if n.Style == 0 {
+				n.Tag = ""
+			}
 		}
-		return m
-	})
+	}
+	for _, c := range n.Content {
+		expandEnv(c)
+	}
 }
 
 // shaped is implemented by types with a YAML form of their own.
@@ -310,6 +395,15 @@ var (
 
 // knownFields reports the first mapping key the target type has no field for.
 func knownFields(n *yaml.Node, t reflect.Type) error {
+	switch n.Kind {
+	case yaml.DocumentNode:
+		if len(n.Content) == 0 {
+			return nil
+		}
+		n = n.Content[0]
+	case yaml.AliasNode:
+		n = n.Alias
+	}
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
@@ -322,6 +416,12 @@ func knownFields(n *yaml.Node, t reflect.Type) error {
 	case n.Kind == yaml.SequenceNode && t.Kind() == reflect.Slice:
 		for _, item := range n.Content {
 			if err := knownFields(item, t.Elem()); err != nil {
+				return err
+			}
+		}
+	case n.Kind == yaml.MappingNode && t.Kind() == reflect.Map:
+		for i := 1; i < len(n.Content); i += 2 {
+			if err := knownFields(n.Content[i], t.Elem()); err != nil {
 				return err
 			}
 		}

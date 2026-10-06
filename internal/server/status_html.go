@@ -919,6 +919,11 @@ paintTheme();
 for (const k of (location.hash || "").slice(1).split(";")){
   if (k) expanded.add(decodeURIComponent(k));
 }
+// ?q= presets the filter, so a link can open the page on one probe.
+{
+  const q = (new URLSearchParams(location.search).get("q") || "").trim();
+  if (q){ query = q; $("find").value = q; }
+}
 
 mountTiles();
 record(state);

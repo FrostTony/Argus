@@ -235,6 +235,18 @@ probes:
       require_status: [clientTransferProhibited]
       forbid_status: [clientHold, pendingDelete]
 
+  # .ru/.su/.рф have no RDAP and go to whois.tcinet.ru; their states are TCI's own.
+  - name: example_domain_ru
+    type: domain
+    interval: 12h
+    timeout: 20s
+    labels: {project: demo}
+    targets:
+      - host: afisha.ru
+    domain:
+      min_days: 45
+      require_status: [delegated, verified]
+
   # TLS separately from HTTP: a certificate lives on the connection, and one
   # backend can be serving an expired one while the rest are fine.
   - name: example_tls

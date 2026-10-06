@@ -209,12 +209,12 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 		if a.Serial > 0 {
 			r.Gauge("dns_soa_serial", float64(a.Serial))
 		}
-		if a.TTL > 0 {
+		if len(a.Records) > 0 {
 			r.Gauge("dns_ttl_seconds", a.TTL.Seconds())
 		}
 		// One series carries the whole set: per-record writes share these labels.
 		r.Info("dns_answer_info", strings.Join(a.Records, ", "))
-		answersBy[server] = a.Records
+		answersBy[server] = normalizeAll(a.Records)
 		replies[server] = a
 	}
 
@@ -341,13 +341,15 @@ func (p *Prober) missing(answers []string) string {
 
 // answer is one resolver's reply, reduced to what the checks need.
 type answer struct {
-	// Records is the answer section filtered to the query type; a CNAME is a link.
+	// Records is the answer section filtered to the query type; a CNAME is a
+	// link. Case is kept: TXT payloads such as DKIM keys are case-sensitive.
 	Records    []string
 	Authority  []string
 	Additional []string
 	Rcode      string
-	TTL        time.Duration
-	RTT        time.Duration
+	// TTL is the lowest among Records, meaningful only when there are any.
+	TTL time.Duration
+	RTT time.Duration
 	// Timing splits the round trip into connecting and answering.
 	Timing timing
 	// Authoritative is the AA flag: the zone answered, not a cache.
@@ -399,8 +401,8 @@ func (p *Prober) query(ctx context.Context, req probe.Request, rec *metrics.Reco
 		if rr.Header().Rrtype != p.qtype {
 			continue // CNAME links are not part of the answer set
 		}
-		out.Records = append(out.Records, normalizeAnswer(rrValue(rr)))
-		if t := time.Duration(rr.Header().Ttl) * time.Second; out.TTL == 0 || t < out.TTL {
+		out.Records = append(out.Records, cleanAnswer(rrValue(rr)))
+		if t := time.Duration(rr.Header().Ttl) * time.Second; len(out.Records) == 1 || t < out.TTL {
 			out.TTL = t
 		}
 	}
@@ -450,12 +452,28 @@ func rrValue(rr dns.RR) string {
 	return strings.TrimSpace(strings.TrimPrefix(rr.String(), rr.Header().String()))
 }
 
-func normalizeAnswer(s string) string {
+// cleanAnswer is a record as reported and matched: addresses in canonical
+// form, names without the root dot.
+func cleanAnswer(s string) string {
 	s = strings.TrimSpace(s)
 	if a, err := netip.ParseAddr(s); err == nil {
 		return a.Unmap().String()
 	}
-	return strings.ToLower(strings.TrimSuffix(s, "."))
+	return strings.TrimSuffix(s, ".")
+}
+
+// normalizeAnswer is a record as compared between sets, where names are
+// case-insensitive.
+func normalizeAnswer(s string) string { return strings.ToLower(cleanAnswer(s)) }
+
+// normalizeAll is the sorted set of normalized records.
+func normalizeAll(records []string) []string {
+	out := make([]string, len(records))
+	for i, r := range records {
+		out[i] = normalizeAnswer(r)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func allEqual(m map[string][]string) bool {

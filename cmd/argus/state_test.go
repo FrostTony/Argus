@@ -29,7 +29,7 @@ func TestTheStateFileWinsOverTheFiles(t *testing.T) {
 	files := writeFile(t, dir, "checks.yaml", validProbes)
 	state := writeFile(t, dir, "pushed.yaml", pushedProbes)
 
-	ck, err := loadChecks(&flags{probes: multiFlag{files}, state: state}, quietLog())
+	ck, err := loadChecks(&flags{probes: multiFlag{files}, state: state}, quietLog(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,11 +40,11 @@ func TestTheStateFileWinsOverTheFiles(t *testing.T) {
 	if len(list) != 1 || list[0].Name != "pushed" {
 		t.Fatalf("the node came back with the files, not with what it was pushed: %+v", list)
 	}
-	if ck.source != app.SourceAPI {
-		t.Fatalf("source is %q, want api", ck.source)
+	if ck.meta.Source != app.SourceAPI {
+		t.Fatalf("source is %q, want api", ck.meta.Source)
 	}
-	if want := config.Hash([]byte(pushedProbes)); ck.hash != want {
-		t.Fatalf("hash is %q, want the sha256 of the saved bytes", ck.hash)
+	if want := config.Hash([]byte(pushedProbes)); ck.meta.Hash != want {
+		t.Fatalf("hash is %q, want the sha256 of the saved bytes", ck.meta.Hash)
 	}
 }
 
@@ -53,12 +53,12 @@ func TestAnUnusableStateFileFallsBackToTheFiles(t *testing.T) {
 	files := writeFile(t, dir, "checks.yaml", validProbes)
 	state := writeFile(t, dir, "pushed.yaml", "probes: [{name: x, type: nosuchkind}]\n")
 
-	ck, err := loadChecks(&flags{probes: multiFlag{files}, state: state}, quietLog())
+	ck, err := loadChecks(&flags{probes: multiFlag{files}, state: state}, quietLog(), true)
 	if err != nil {
 		t.Fatalf("a broken state file must not stop the node: %v", err)
 	}
-	if ck.source != app.SourceFile {
-		t.Fatalf("source is %q, want file", ck.source)
+	if ck.meta.Source != app.SourceFile {
+		t.Fatalf("source is %q, want file", ck.meta.Source)
 	}
 	// Left on disk: it is the evidence of what the node was asked to run.
 	if _, err := os.Stat(state); err != nil {
@@ -69,12 +69,12 @@ func TestAnUnusableStateFileFallsBackToTheFiles(t *testing.T) {
 func TestANodeWithOnlyAStateFileStartsEmpty(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "state", "pushed.yaml")
 
-	ck, err := loadChecks(&flags{state: state}, quietLog())
+	ck, err := loadChecks(&flags{state: state}, quietLog(), true)
 	if err != nil {
 		t.Fatalf("a node waiting for its first push must still start: %v", err)
 	}
-	if ck.source != app.SourceNone {
-		t.Fatalf("source is %q, want none", ck.source)
+	if ck.meta.Source != app.SourceNone {
+		t.Fatalf("source is %q, want none", ck.meta.Source)
 	}
 	if len(ck.probes.List) != 0 {
 		t.Fatalf("it checks %d probe(s) out of nowhere", len(ck.probes.List))
@@ -92,7 +92,7 @@ func TestThePersisterWritesTheStateFileAndItsDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ck, err := loadChecks(&flags{state: state}, quietLog())
+	ck, err := loadChecks(&flags{state: state}, quietLog(), true)
 	if err != nil {
 		t.Fatalf("the node cannot start from what it saved: %v", err)
 	}
@@ -140,14 +140,14 @@ func TestMissingCheckFilesAreNotFatalWithAStateFile(t *testing.T) {
 	ck, err := loadChecks(&flags{
 		probes: multiFlag{filepath.Join(dir, "probes.d")},
 		state:  filepath.Join(dir, "pushed.yaml"),
-	}, quietLog())
+	}, quietLog(), true)
 	if err != nil {
 		t.Fatalf("a node waiting for its first push must still start: %v", err)
 	}
-	if ck.source != app.SourceNone {
-		t.Fatalf("source is %q, want none", ck.source)
+	if ck.meta.Source != app.SourceNone {
+		t.Fatalf("source is %q, want none", ck.meta.Source)
 	}
-	if _, err := loadChecks(&flags{probes: multiFlag{filepath.Join(dir, "probes.d")}}, quietLog()); err == nil {
+	if _, err := loadChecks(&flags{probes: multiFlag{filepath.Join(dir, "probes.d")}}, quietLog(), true); err == nil {
 		t.Fatal("without a state file, unreadable check files are still an error")
 	}
 }

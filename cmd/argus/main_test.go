@@ -207,7 +207,7 @@ func TestWatchFilesReloadsOnAChange(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	go watchFiles(ctx, []string{dir}, 10*time.Millisecond, reload, discard())
+	go watchFiles(ctx, []string{dir}, "", 10*time.Millisecond, reload, discard())
 
 	// An unchanged directory must not reload.
 	select {
@@ -244,7 +244,7 @@ func TestWatchFilesDoesNotRetryARejectedConfiguration(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	go watchFiles(ctx, []string{dir}, 10*time.Millisecond, reload, discard())
+	go watchFiles(ctx, []string{dir}, "", 10*time.Millisecond, reload, discard())
 	time.Sleep(50 * time.Millisecond) // let it take its baseline
 
 	if err := os.WriteFile(path, []byte(validProbes+"\n# edited\n"), 0o600); err != nil {
@@ -253,5 +253,32 @@ func TestWatchFilesDoesNotRetryARejectedConfiguration(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if got := attempts.Load(); got != 1 {
 		t.Fatalf("a rejected configuration was retried %d times", got)
+	}
+}
+
+// A change made between loading the files and starting the watcher - while
+// the probes were being built - must still be picked up.
+func TestWatchFilesStartsFromWhatWasLoaded(t *testing.T) {
+	dir := t.TempDir()
+	path := writeFile(t, dir, "checks.yaml", validProbes)
+	loaded, err := config.LoadFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(validProbes+"\n# edited during startup\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reloads := make(chan struct{}, 4)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go watchFiles(ctx, []string{dir}, loaded.Fingerprint, 10*time.Millisecond, func() error {
+		reloads <- struct{}{}
+		return nil
+	}, discard())
+	select {
+	case <-reloads:
+	case <-ctx.Done():
+		t.Fatal("a change made during startup was never applied")
 	}
 }

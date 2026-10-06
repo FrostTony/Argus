@@ -153,10 +153,12 @@ func (p *Prober) stream(ctx context.Context, path string, req probe.Request, rec
 		return p.upgrade(ctx, c, req, rec, &res)
 	}
 	if p.cfg.TLS {
-		if conn, err = upgrade(ctx, conn); err != nil {
+		tconn, err := upgrade(ctx, conn)
+		if err != nil {
 			res.Err = probe.Wrap(probe.ReasonTLS, err)
 			return res
 		}
+		conn = tconn
 	}
 
 	conn, res.Err = p.script.Run(ctx, conn, rec, &res, upgrade)

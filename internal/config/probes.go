@@ -328,7 +328,6 @@ func (p *Probes) Resolve() ([]Probe, error) {
 			merged = merged.mergeFrom(tpl)
 		}
 		merged = merged.mergeFrom(probe)
-		merged.Name = probe.Name
 
 		if merged.Type == "" {
 			return nil, fmt.Errorf("probes[%d] (%s): probe type is missing", i, probe.Name)
@@ -403,10 +402,12 @@ func CheckTiming(interval, timeout time.Duration, requests int) error {
 // list or options block replaces, and labels are unioned with other winning.
 func (p Probe) mergeFrom(other Probe) Probe {
 	res := p
+	res.Name = cmp.Or(other.Name, p.Name)
 	res.Type = cmp.Or(other.Type, p.Type)
 	res.IPVersion = cmp.Or(other.IPVersion, p.IPVersion)
 	res.IPFallback = pick(other.IPFallback, p.IPFallback)
 	res.SourceIP = cmp.Or(other.SourceIP, p.SourceIP)
+	res.Hostname = cmp.Or(other.Hostname, p.Hostname)
 	res.NegativeTest = pick(other.NegativeTest, p.NegativeTest)
 	res.RequestsPerProbe = cmp.Or(other.RequestsPerProbe, p.RequestsPerProbe)
 	res.RunOn = cmp.Or(other.RunOn, p.RunOn)

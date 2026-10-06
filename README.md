@@ -146,7 +146,9 @@ probes:
 ```
 
 `${VAR}` in a configuration file is replaced from the environment, which is how
-secrets stay out of the file. Secrets can also be read from disk on each use —
+secrets stay out of the file. It is replaced inside values once the YAML is
+parsed, so a secret may hold any character, and `GET /api/config` serves the
+reference, never the secret. Secrets can also be read from disk on each use —
 `password_file`, `token_file`, `client_secret_file` — so rotating one needs no
 restart.
 
@@ -166,7 +168,7 @@ itself.
 | `websocket` | the RFC 6455 upgrade, and optionally a message over the open socket | `path`, `tls`, `subprotocols`, `origin`, `send`+`expect`, `ping` |
 | `icmp` | loss and jitter per address | `packets`, `interval`, `max_loss_percent`, `ttl`, `tos`, `privileged` |
 | `grpc` | the health service, spoken directly over HTTP/2 | `port`, `service`, `plaintext`, `authority` |
-| `domain` | the registration behind the domain over RDAP: expiry, registrar, EPP status | `min_days`, `require_status`, `forbid_status` |
+| `domain` | the registration behind the domain over RDAP, or WHOIS where the registry has none: expiry, registrar, status | `min_days`, `require_status`, `forbid_status`, `whois`, `refresh` |
 | `external` | anything that exits 0 and prints `name value` lines | `command`, `args`, `env`, `mode`, `metric_prefix` |
 
 HTTP authentication covers basic, bearer and the OAuth2 client-credentials flow.
@@ -323,14 +325,44 @@ reported through the `tls_*` series. The round trip is split into the
 
 Registration data over RDAP, answered by the registry rather than the host.
 
+Not every registry runs RDAP. `.ru`, `.su` and `.рф` are missing from the IANA bootstrap, and
+`rdap.org` answers them 404, so these go to WHOIS on port 43 instead. The parser reads
+`key: value` lines in TCI's layout (`paid-till`, `created`, `state`) and in the ICANN one
+(`Registry Expiry Date`, `Domain Status`). The built-in table maps `ru`/`su`/`рф` to
+`whois.tcinet.ru`; `whois:` adds to it or overrides it, and an empty address sends a suffix
+back to RDAP:
+
+```yaml
+domain:
+  whois:
+    kz: whois.nic.kz
+    by: whois.cctld.by:43
+```
+
+The suffix is matched against the name's whole public suffix: `example.msk.ru` is not TCI's
+and needs its own entry. WHOIS states are each registry's own (TCI's are `REGISTERED`,
+`DELEGATED`, `VERIFIED`), so `domain_locked` is written for RDAP only: `.ru` has no transfer
+lock, and a 0 would read as one that was taken off.
+
+Answers are cached in memory per registry and registrable name, shared by every target,
+probe and reload generation on the node: `www.example.com` and `api.example.com` cost one
+lookup, and so do ten probes asking at once. An answer is reused for `refresh` (6h by
+default), a registration within `max(min_days, 7)` days of its end and a failed lookup for
+30 minutes, so that a renewal clears the alert quickly. When the registry stops answering
+or starts rate-limiting, the last good answer stands in for up to a day, and
+`domain_fetched_seconds` keeps its original time: `time() - domain_fetched_seconds > 86400`
+is the alert for that. A "not registered" answer is never papered over. Queries to one
+WHOIS server go one at a time.
+
 | Metric | Shows | How |
 |---|---|---|
 | `domain_expiry_days` | life left in the registration | the expiry event minus now, in days |
-| `domain_expiry_seconds`, `domain_registered_seconds` | the registration window | RDAP event dates as unix timestamps |
+| `domain_expiry_seconds`, `domain_registered_seconds` | the registration window | RDAP event dates (WHOIS `paid-till`/`created`) as unix timestamps |
 | `domain_age_days` | how long the name has existed | now minus the registration date |
-| `domain_locked` | whether the transfer lock is on | 1 when the status list carries a `clientTransferProhibited`-style lock |
+| `domain_locked` | whether the transfer lock is on | 1 when the status list carries a `clientTransferProhibited`-style lock; RDAP only |
 | `domain_registrar_info{val}`, `domain_status_info{val}` | who holds it and in what state | registrar name and the EPP status codes, as labels |
-| `domain_lookup_duration_seconds` | how long the registry took | measured around the RDAP request |
+| `domain_lookup_duration_seconds` | how long the registry took | measured around the RDAP or WHOIS request; cached answers are not counted |
+| `domain_fetched_seconds` | how old the registration data is | when the registry gave the answer in use, as a unix timestamp |
 
 ### `tcp`, `unix`, `udp`, `websocket`, `grpc`, `external`
 
@@ -385,7 +417,7 @@ disappears stop being written and are retired after `stale_after`.
 | `GET /`, `GET /status` | none | status page |
 | `GET /status.json`, `GET /status/data` | none | the same state as JSON, plus `version`, `config_source` and `config_hash` |
 | `GET /healthz` | none | liveness |
-| `GET /api/config` | read | the current check configuration as YAML |
+| `GET /api/config` | read | the current check configuration as accepted, `${VAR}` unexpanded |
 | `PUT\|POST /api/config` | write | replace it, and write it back to disk (`-state`, or the single `-probes` file) |
 | `POST /api/reload` | write | re-read the files |
 | `POST /api/probes` | write | run a probe now, off its schedule (`?name=` for one) |

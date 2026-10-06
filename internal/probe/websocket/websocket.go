@@ -121,10 +121,12 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 	}
 
 	if target.secure {
-		if conn, err = p.upgradeTLS(ctx, conn, target.host, rec, &res); err != nil {
+		tconn, err := p.upgradeTLS(ctx, conn, target.host, rec, &res)
+		if err != nil {
 			res.Err = probe.Wrap(probe.ReasonTLS, err)
 			return res
 		}
+		conn = tconn
 	}
 
 	r := bufio.NewReader(conn)

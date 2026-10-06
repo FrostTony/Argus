@@ -61,7 +61,7 @@ func answer(expiry, registered time.Time, status ...string) map[string]any {
 	}
 }
 
-func newProber(t *testing.T, options string) probe.Prober {
+func probeConfig(t *testing.T, options string) config.Probe {
 	t.Helper()
 	var node yaml.Node
 	if err := yaml.Unmarshal([]byte(options), &node); err != nil {
@@ -71,7 +71,13 @@ func newProber(t *testing.T, options string) probe.Prober {
 	if len(node.Content) > 0 {
 		pc.Options = *node.Content[0]
 	}
-	p, err := New(pc)
+	return pc
+}
+
+func newProber(t *testing.T, options string) probe.Prober {
+	t.Helper()
+	answers = newCache() // every test starts with registries nobody has asked yet
+	p, err := New(probeConfig(t, options))
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -318,12 +324,7 @@ func TestATLDIsNotARegistrableDomain(t *testing.T) {
 }
 
 func TestNegativeMinDaysIsRejectedAtBuild(t *testing.T) {
-	var node yaml.Node
-	if err := yaml.Unmarshal([]byte("min_days: -1"), &node); err != nil {
-		t.Fatal(err)
-	}
-	pc := config.Probe{Name: "test", Type: "domain", Options: *node.Content[0]}
-	if _, err := New(pc); err == nil {
+	if _, err := New(probeConfig(t, "min_days: -1")); err == nil {
 		t.Fatal("want an error for a negative min_days")
 	}
 }

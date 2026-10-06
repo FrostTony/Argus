@@ -85,10 +85,12 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 		return p.upgrade(ctx, c, req, rec, &res)
 	}
 	if p.cfg.TLS {
-		if conn, err = upgrade(ctx, conn); err != nil {
+		tconn, err := upgrade(ctx, conn)
+		if err != nil {
 			res.Err = probe.Wrap(probe.ReasonTLS, err)
 			return res
 		}
+		conn = tconn
 	}
 
 	conn, res.Err = p.script.Run(ctx, conn, rec, &res, upgrade)

@@ -65,7 +65,6 @@ func TestUnknownFieldInAFileIsRejected(t *testing.T) {
 	}
 }
 
-// Substitution happens before the YAML is parsed, so a token may sit anywhere.
 func TestFilesExpandEnvironmentReferences(t *testing.T) {
 	t.Setenv("ARGUS_TEST_TOKEN", "s3cret")
 	dir := t.TempDir()

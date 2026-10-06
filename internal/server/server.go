@@ -19,8 +19,6 @@ import (
 	"strings"
 	"time"
 
-	"gopkg.in/yaml.v3"
-
 	"github.com/tonyamdfrost-cmd/Argus/internal/app"
 	"github.com/tonyamdfrost-cmd/Argus/internal/config"
 	"github.com/tonyamdfrost-cmd/Argus/internal/metrics"
@@ -164,29 +162,32 @@ func (s *api) check(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// A body, when present, is a probe definition of its own.
+	var body []byte
 	if r.Method == http.MethodPost || r.Method == http.MethodPut {
-		body, err := io.ReadAll(io.LimitReader(r.Body, maxConfigBody))
-		if err != nil {
+		var err error
+		if body, err = io.ReadAll(io.LimitReader(r.Body, maxConfigBody)); err != nil {
 			writeJSON(w, http.StatusBadRequest, errorBody{err.Error()})
 			return
 		}
-		if len(bytes.TrimSpace(body)) > 0 {
-			spec, err := config.ParseProbe(body)
-			if err != nil {
-				writeJSON(w, http.StatusBadRequest, errorBody{err.Error()})
-				return
-			}
-			req.Spec = &spec
-		}
 	}
+	definition := len(bytes.TrimSpace(body)) > 0
 
 	tokens := s.cfg.ReadTokens()
-	if req.Spec != nil || req.Target != "" || req.Hostname != "" || req.Debug {
+	if definition || req.Target != "" || req.Hostname != "" || req.Debug {
 		tokens = s.cfg.WriteTokens()
 	}
 	if !s.authorized(r, tokens) {
 		writeJSON(w, http.StatusUnauthorized, errorBody{"unauthorized"})
 		return
+	}
+	// Parsed only once authorised: parsing expands ${VAR}, and its errors quote values.
+	if definition {
+		spec, err := config.ParseProbe(body)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, errorBody{err.Error()})
+			return
+		}
+		req.Spec = &spec
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.checkTimeout(r))
@@ -304,8 +305,9 @@ func (s *api) authorized(r *http.Request, tokens []string) bool {
 	return ok
 }
 
-// config serves the running check configuration on GET and replaces it on PUT.
-// A rejected configuration changes nothing.
+// config serves the running check configuration on GET, as it was accepted and
+// with ${VAR} unexpanded, and replaces it on PUT. A rejected configuration
+// changes nothing.
 func (s *api) config(w http.ResponseWriter, r *http.Request) {
 	tokens := s.cfg.WriteTokens()
 	if r.Method == http.MethodGet {
@@ -318,13 +320,8 @@ func (s *api) config(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		data, err := yaml.Marshal(s.app.Probes())
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, errorBody{err.Error()})
-			return
-		}
 		w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
-		_, _ = w.Write(data)
+		_, _ = w.Write(s.app.ConfigMeta().Document)
 
 	case http.MethodPut, http.MethodPost:
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxConfigBody))
@@ -346,24 +343,20 @@ func (s *api) config(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Applied before it is written: an unrunnable config must not be stored.
-		if err := s.app.Reload(probes); err != nil {
+		meta := app.ConfigMeta{Source: app.SourceAPI, Hash: config.Hash(body), Document: body}
+		err = s.app.Replace(probes, meta, func() error { return s.files.Persist(body) })
+		switch {
+		case errors.Is(err, app.ErrNotSaved):
+			s.app.Log.Error("config applied but not saved", "from", clientOf(r), "err", err)
+			writeJSON(w, http.StatusInternalServerError, errorBody{err.Error()})
+			return
+		case err != nil:
 			s.app.Log.Warn("config rejected", "from", clientOf(r), "bytes", len(body), "err", err)
 			writeJSON(w, http.StatusBadRequest, errorBody{err.Error()})
 			return
 		}
-		if err := s.files.Persist(body); err != nil {
-			s.app.Log.Error("config applied but not saved", "from", clientOf(r), "err", err)
-			writeJSON(w, http.StatusInternalServerError, errorBody{
-				"the node is running this configuration but could not save it, " +
-					"so a restart will undo it: " + err.Error()})
-			return
-		}
-		// Recorded only now: the hash must describe a configuration that is
-		// both running and saved.
-		s.app.SetConfigMeta(app.SourceAPI, config.Hash(body))
 		s.app.Log.Info("config replaced via api",
-			"from", clientOf(r), "bytes", len(body), "probes", len(probes.List),
-			"hash", config.Hash(body))
+			"from", clientOf(r), "bytes", len(body), "probes", len(probes.List), "hash", meta.Hash)
 		writeJSON(w, http.StatusOK, s.app.Status())
 
 	default:
@@ -414,12 +407,20 @@ type errorBody struct {
 	Error string `json:"error"`
 }
 
+// writeJSON encodes before it answers, so a value that cannot be encoded is a
+// 500 rather than a success with an empty body.
 func writeJSON(w http.ResponseWriter, code int, v any) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		code = http.StatusInternalServerError
+		buf.Reset()
+		_ = enc.Encode(errorBody{err.Error()})
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	_ = enc.Encode(v)
+	_, _ = buf.WriteTo(w)
 }
 
 // clientOf identifies the caller for the audit log; the proxy header is

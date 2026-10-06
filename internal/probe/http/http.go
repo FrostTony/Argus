@@ -83,6 +83,8 @@ type Prober struct {
 	validators []Validator
 	proxy      func(*url.URL) (*url.URL, error)
 	body       []byte
+	// path is the configured path, parsed once so a query in it stays a query.
+	path *url.URL
 }
 
 func New(pc config.Probe) (probe.Prober, error) {
@@ -106,10 +108,24 @@ func New(pc config.Probe) (probe.Prober, error) {
 	if len(vs) == 0 {
 		vs = []Validator{{Name: "status", StatusCode: []string{"200-399"}}}
 	}
+	if p.cfg.Path != "" {
+		u, err := url.Parse(p.cfg.Path)
+		if err != nil || u.Scheme != "" || u.Host != "" {
+			return nil, fmt.Errorf("http.path: %q is not a path", p.cfg.Path)
+		}
+		p.path = u
+	}
+
 	p.sizeLimit = 2 * p.maxBody
+	if !p.readBody {
+		p.sizeLimit = p.maxBody
+	}
 	for i := range vs {
 		if err := vs[i].compile(); err != nil {
 			return nil, fmt.Errorf("validators[%d]: %w", i, err)
+		}
+		if !p.readBody && vs[i].readsBody() {
+			return nil, fmt.Errorf("validators[%d]: body_regex, body_not_regex and json_path need the body, and read_body is false", i)
 		}
 		p.keepBody = p.keepBody || vs[i].readsBody()
 		p.sizeLimit = max(p.sizeLimit, vs[i].MaxSizeBytes+1)
@@ -309,9 +325,16 @@ func (p *Prober) client(req probe.Request, u *url.URL) (*http.Client, *connSet) 
 			// The presented name is pinned to the transport, so following a
 			// redirect elsewhere would offer it to a host it does not belong
 			// to. Another domain is another service, as it is for the backend.
-			if req.Hostname != "" && !sameName(r.URL.Hostname(), origin) {
+			same := sameName(r.URL.Hostname(), origin)
+			if req.Hostname != "" && !same {
 				return fmt.Errorf("redirect to %s: hostname=%s is the name presented to %s, and another host is another service",
 					r.URL.Host, req.Hostname, origin)
+			}
+			// net/http keeps an overridden Host only across relative redirects;
+			// an absolute one back to the same name would present another name
+			// than the SNI.
+			if same && r.Host == "" {
+				r.Host = via[0].Host
 			}
 			return nil
 		}
@@ -373,26 +396,28 @@ func pin(addr string, b probe.Backend) string {
 
 // targetURL builds the request address; the probe's path overrides the target's.
 func (p *Prober) targetURL(t probe.Target) (*url.URL, error) {
-	if t.URL != nil {
-		u := *t.URL
-		if p.cfg.Path != "" {
-			u.Path = p.cfg.Path
-			u.RawQuery = ""
-		}
-		return &u, nil
-	}
-	if t.Host == "" {
+	var u url.URL
+	switch {
+	case t.URL != nil:
+		u = *t.URL
+	case t.Host == "":
 		return nil, fmt.Errorf("target has neither url nor host")
+	default:
+		u = url.URL{Scheme: "https", Host: t.Host, Path: "/"}
+		if strings.Contains(t.Host, ":") {
+			u.Host = "[" + t.Host + "]" // an IPv6 literal
+		}
+		switch {
+		case t.Port == 80:
+			u.Scheme = "http"
+		case t.Port != 0 && t.Port != 443:
+			u.Host = net.JoinHostPort(t.Host, strconv.Itoa(t.Port))
+		}
 	}
-	scheme := "https"
-	if t.Port == 80 {
-		scheme = "http"
+	if p.path != nil {
+		u.Path, u.RawPath, u.RawQuery = p.path.Path, p.path.RawPath, p.path.RawQuery
 	}
-	host := t.Host
-	if t.Port != 0 && t.Port != 80 && t.Port != 443 {
-		host = net.JoinHostPort(host, strconv.Itoa(t.Port))
-	}
-	return &url.URL{Scheme: scheme, Host: host, Path: cmp.Or(p.cfg.Path, "/")}, nil
+	return &u, nil
 }
 
 func (p *Prober) buildRequest(ctx context.Context, u *url.URL, t *timings) (*http.Request, error) {
@@ -422,7 +447,7 @@ func (p *Prober) buildRequest(ctx context.Context, u *url.URL, t *timings) (*htt
 // drain reads the body, bounded, and returns what was kept and the size read.
 func (p *Prober) drain(resp *http.Response) (string, int64, error) {
 	if !p.readBody {
-		n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, p.maxBody))
+		n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, p.sizeLimit))
 		return "", n, nil
 	}
 	var sb strings.Builder

@@ -245,3 +245,15 @@ func TestBadTLSConfigIsRejectedForEveryNetwork(t *testing.T) {
 		}
 	}
 }
+
+func TestFailedTLSHandshakeIsAFailureNotAPanic(t *testing.T) {
+	path := serveStream(t, "not tls at all\r\n\r\n")
+	p, err := build(t, "tls: true\ntls_config: {insecure_skip_verify: true}\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, _ := run(t, p, path)
+	if got := probe.ReasonOf(res.Err); got != probe.ReasonTLS {
+		t.Fatalf("reason = %q, want %q (err %v)", got, probe.ReasonTLS, res.Err)
+	}
+}

@@ -3,10 +3,12 @@ package surfacer
 
 import (
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tonyamdfrost-cmd/Argus/internal/metrics"
 )
@@ -90,16 +92,17 @@ func newMetricNames(base string) metricNames {
 }
 
 func (p *Prometheus) appendSample(buf []byte, now int64, n metricNames, s metrics.Sample) []byte {
+	l := validLabels(s.Labels)
 	switch v := s.Value.(type) {
 	case metrics.Counter:
-		return p.appendLine(buf, now, n.base, s.Labels, "", "", float64(v))
+		return p.appendLine(buf, now, n.base, l, "", "", float64(v))
 	case metrics.Gauge:
-		return p.appendLine(buf, now, n.base, s.Labels, "", "", float64(v))
+		return p.appendLine(buf, now, n.base, l, "", "", float64(v))
 	case metrics.Info:
 		// A string value becomes the `val` label at 1, the usual *_info shape.
-		return p.appendLine(buf, now, n.base, s.Labels, "val", string(v), 1)
+		return p.appendLine(buf, now, n.base, l, "val", validUTF8(string(v)), 1)
 	case *metrics.Dist:
-		return p.appendDist(buf, now, n, s.Labels, v)
+		return p.appendDist(buf, now, n, l, v)
 	}
 	return buf
 }
@@ -205,6 +208,29 @@ func appendEscaped(buf []byte, s string) []byte {
 		}
 	}
 	return buf
+}
+
+// validLabels repairs values that are not valid UTF-8, as one taken from a
+// header or a certificate can be: a single such value makes a receiver reject
+// the whole page or request.
+func validLabels(l metrics.Labels) metrics.Labels {
+	for i, lb := range l {
+		if !utf8.ValidString(lb.Value) {
+			l = slices.Clone(l)
+			for j := i; j < len(l); j++ {
+				l[j].Value = validUTF8(l[j].Value)
+			}
+			break
+		}
+	}
+	return l
+}
+
+func validUTF8(s string) string {
+	if utf8.ValidString(s) {
+		return s
+	}
+	return strings.ToValidUTF8(s, string(utf8.RuneError))
 }
 
 // promType maps a value kind to a type; a bucketless distribution is a summary.

@@ -264,19 +264,21 @@ func (r *Runner) plan(ctx context.Context, tr *targetRun) []unit {
 
 	backends, err := r.backends(ctx, tr.target, tr.rec)
 	if err != nil {
+		err = &Error{Reason: ReasonDNS, Err: err}
 		tr.rec.Count(SeriesTotal, 1)
 		tr.rec.Count(SeriesFailure, 1, "reason", string(ReasonDNS))
 		tr.rec.Gauge(SeriesUp, 0)
 		tr.rec.Gauge(SeriesBackends, 0)
 		tr.rec.Gauge(SeriesBackendsUp, 0)
-		r.Log.Debug("resolution failed", "probe", r.Name, "target", tr.target.Name, "err", err)
-		if r.state().changed(unitKey{tr.target.Name, resolveUnit}, tr.rec.Base(), false, err) {
+		r.Log.Debug("resolution failed", "probe", r.Name, "target", tr.target.Name, "err", Message(err))
+		// A cancelled lookup says nothing about the name.
+		if ctx.Err() == nil && r.state().changed(unitKey{tr.target.Name, resolveUnit}, tr.rec.Base(), false, err) {
 			r.Log.Warn("target stopped resolving",
 				"probe", r.Name, "type", r.Kind, "target", tr.target.Name,
 				"host", tr.target.Host, "err", Message(err))
 		}
 		if r.Observe != nil {
-			r.Observe(r.request(tr.target, Backend{}), Wrap(ReasonDNS, err))
+			r.Observe(r.request(tr.target, Backend{}), err)
 		}
 		return nil
 	}
@@ -401,9 +403,11 @@ func forEach[T any](ctx context.Context, items []T, n int, fn func(T)) {
 	wg.Wait()
 }
 
-// TargetLabels are the labels this runner gives a target's own series.
+// TargetLabels are the labels this runner gives a target's own series. Identity
+// is merged last: a target label must not move series out of reach of the probe
+// that owns them.
 func (r *Runner) TargetLabels(t Target) metrics.Labels {
-	return r.Labels.Merge(metrics.L("probe", r.Name, "target", t.Name)).Merge(t.Labels)
+	return r.Labels.Merge(t.Labels).Merge(metrics.L("probe", r.Name, "target", t.Name))
 }
 
 func (r *Runner) backends(ctx context.Context, t Target, rec *metrics.Recorder) ([]Backend, error) {
@@ -493,16 +497,18 @@ func (r *Runner) probeOne(ctx context.Context, req Request, rec *metrics.Recorde
 	if r.Observe != nil {
 		r.Observe(req, res.Err)
 	}
-	if res.OK() {
+	ok := res.OK()
+	if ok {
 		rec.Gauge(SeriesUp, 1)
-		r.logResult(req, rec.Base(), true, elapsed, nil)
-		return true
+	} else {
+		rec.Count(SeriesFailure, 1, "reason", string(ReasonOf(res.Err)))
+		rec.Gauge(SeriesUp, 0)
 	}
-
-	rec.Count(SeriesFailure, 1, "reason", string(ReasonOf(res.Err)))
-	rec.Gauge(SeriesUp, 0)
-	r.logResult(req, rec.Base(), false, elapsed, res.Err)
-	return false
+	// A cancelled run says nothing about the backend: its health stays as it was.
+	if ctx.Err() == nil {
+		r.logResult(req, rec.Base(), ok, elapsed, res.Err)
+	}
+	return ok
 }
 
 // attempt is one request of a run, under a timeout of its own.

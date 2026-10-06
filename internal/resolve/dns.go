@@ -2,6 +2,7 @@ package resolve
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -59,51 +60,59 @@ func (d *DNS) Resolve(ctx context.Context, host string, family Family) (Result, 
 		qtypes = qtypes[1:]
 	}
 
-	var res Result
-	var addrs []netip.Addr
-	var lastErr error
-
+	// A server counts only when it answers every question: a lost A reply beside
+	// a good AAAA one is no answer. Failing that, the first partial answer comes
+	// back with its error, so the cache holds it as a failure, not for its TTL.
+	var partial Result
+	var partialErr error
+	err := errNoServers
 	for _, server := range d.Servers {
 		start := time.Now()
-		answers := d.ask(ctx, host, qtypes, server)
-		var ok bool
-		for _, a := range answers {
-			if a.err != nil {
-				lastErr = a.err
-				continue
-			}
-			ok = true
-			addrs = append(addrs, a.addrs...)
-			// Keep the smallest TTL seen, so the cache outlives no part of the answer.
-			if a.ttl > 0 && (res.TTL == 0 || a.ttl < res.TTL) {
-				res.TTL = a.ttl
-			}
+		res, answered, qerr := merge(d.ask(ctx, host, qtypes, server))
+		// Both families are asked at once, so this is the slower of the two.
+		res.Duration, res.Server = time.Since(start), server
+		res.Addrs = filter(res.Addrs, family, d.Order)
+		switch {
+		case qerr == nil && len(res.Addrs) == 0:
+			return res, ErrNoAddresses
+		case qerr == nil:
+			return res, nil
+		case answered > 0 && partialErr == nil:
+			partial, partialErr = res, qerr
 		}
-		if ok {
-			// Both families are asked at once, so this is the slower of the two.
-			res.Duration = time.Since(start)
-			res.Server = server
-			break
-		}
+		err = qerr
 	}
-
-	if res.Server == "" {
-		if lastErr == nil {
-			lastErr = fmt.Errorf("no resolvers configured")
-		}
-		return res, lastErr
+	if partialErr != nil {
+		return partial, partialErr
 	}
-	res.Addrs = filter(addrs, family, d.Order)
-	if len(res.Addrs) == 0 {
-		return res, ErrNoAddresses
-	}
-	return res, nil
+	return Result{}, err
 }
 
+// merge combines one server's replies. The TTL is the smallest of any record,
+// so the cache outlives no part of the answer.
+func merge(replies []reply) (res Result, answered int, err error) {
+	var seen bool
+	for _, r := range replies {
+		if r.err != nil {
+			err = r.err
+			continue
+		}
+		answered++
+		res.Addrs = append(res.Addrs, r.addrs...)
+		if r.hasTTL && (!seen || r.ttl < res.TTL) {
+			res.TTL, seen = r.ttl, true
+		}
+	}
+	return res, answered, err
+}
+
+var errNoServers = errors.New("no resolvers configured")
+
 type reply struct {
-	addrs []netip.Addr
-	ttl   time.Duration
-	err   error
+	addrs  []netip.Addr
+	ttl    time.Duration
+	hasTTL bool
+	err    error
 }
 
 // ask puts every question to one server at the same time.
@@ -148,21 +157,19 @@ func (d *DNS) query(ctx context.Context, host string, qtype uint16, server strin
 
 	var out reply
 	for _, rr := range resp.Answer {
+		// Every record of the chain bounds the answer's life, CNAMEs included.
+		if t := time.Duration(rr.Header().Ttl) * time.Second; !out.hasTTL || t < out.ttl {
+			out.ttl, out.hasTTL = t, true
+		}
 		var a netip.Addr
 		switch v := rr.(type) {
 		case *dns.A:
 			a, _ = netip.AddrFromSlice(v.A.To4())
 		case *dns.AAAA:
 			a, _ = netip.AddrFromSlice(v.AAAA)
-		default:
-			continue // CNAMEs are not addresses
 		}
-		if !a.IsValid() {
-			continue
-		}
-		out.addrs = append(out.addrs, a.Unmap())
-		if t := time.Duration(rr.Header().Ttl) * time.Second; out.ttl == 0 || t < out.ttl {
-			out.ttl = t
+		if a.IsValid() {
+			out.addrs = append(out.addrs, a.Unmap())
 		}
 	}
 	return out

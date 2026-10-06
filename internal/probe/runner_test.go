@@ -213,6 +213,23 @@ func TestRunnerReportsResolutionFailure(t *testing.T) {
 	if got := c.gauge(t, SeriesBackends); got != 0 {
 		t.Fatalf("target_backends = %v, want 0", got)
 	}
+	if got := r.Failures()["site|resolve"].Reason; got != ReasonDNS {
+		t.Fatalf("Failures() reason = %q, want %q like the metric", got, ReasonDNS)
+	}
+}
+
+// A target label must not take over the probe's identity, or removing the probe
+// leaves the target's series behind.
+func TestRunnerIdentityOutranksTargetLabels(t *testing.T) {
+	r := newRunner(&fakeProber{}, "10.0.0.1")
+	r.Source = StaticTargets{{Name: "site", Host: "site.example", Port: 443, Labels: metrics.L("probe", "x", "target", "y")}}
+	store := metrics.NewStore(0, 0)
+	r.RunOnce(context.Background(), store)
+
+	store.Drop(func(s metrics.Sample) bool { return s.Labels.Get("probe") == r.Name })
+	if left := store.Snapshot(); len(left) > 0 {
+		t.Fatalf("%d series survive the removal of their probe, e.g. %v", len(left), left[0].Labels)
+	}
 }
 
 func TestRunnerTreatsIPLiteralAsItsOwnBackend(t *testing.T) {

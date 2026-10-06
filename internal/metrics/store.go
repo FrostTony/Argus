@@ -269,12 +269,17 @@ func (s *Store) Snapshot() []Sample {
 		s.mu.RLock()
 	}
 	defer s.mu.RUnlock()
+	return s.snapshotLocked(now)
+}
 
+// snapshotLocked reads the order as it stands. A write landing between the
+// reorder and the read lock may have removed series from it, so it checks each.
+func (s *Store) snapshotLocked(now int64) []Sample {
 	out := make([]Sample, 0, len(s.order))
 	// Histograms are copied so a write during the scrape cannot change them.
 	arena := newDistArena(s.order, now)
 	for _, se := range s.order {
-		if se.stale(now) {
+		if !se.live(now) {
 			continue
 		}
 		v := se.sample.Value
@@ -295,7 +300,7 @@ type distArena struct {
 func newDistArena(order []*series, now int64) *distArena {
 	n, slots := 0, 0
 	for _, se := range order {
-		if se.stale(now) {
+		if !se.live(now) {
 			continue
 		}
 		if d, ok := se.sample.Value.(*Dist); ok {
@@ -377,3 +382,5 @@ func (s *Store) expiry(t time.Time, every time.Duration) int64 {
 }
 
 func (se *series) stale(now int64) bool { return se.expires != 0 && se.expires < now }
+
+func (se *series) live(now int64) bool { return !se.gone && !se.stale(now) }

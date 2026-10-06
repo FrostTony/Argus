@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"sync"
 	"time"
@@ -390,10 +391,19 @@ func absorb(entry *BackendCheck, s metrics.Sample) {
 	// Counters and distributions say nothing new for a single run.
 	switch v := s.Value.(type) {
 	case metrics.Gauge:
-		entry.Metrics[s.Name] = float64(v)
+		entry.Metrics[s.Name] = jsonNumber(float64(v))
 	case metrics.Info:
 		entry.Metrics[s.Name] = string(v)
 	}
+}
+
+// jsonNumber is a value JSON can carry: NaN and ±Inf, which a gauge may hold,
+// become null instead of failing the whole answer.
+func jsonNumber(f float64) any {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil
+	}
+	return f
 }
 
 // traceSink captures the run's log lines for the response.

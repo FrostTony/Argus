@@ -159,12 +159,15 @@ func TestDurationAcceptsBareSeconds(t *testing.T) {
 
 func TestExpandEnvLeavesRegexAlone(t *testing.T) {
 	t.Setenv("ARGUS_TEST_TOKEN", "s3cret")
-	got := string(expandEnv([]byte(`a: ${ARGUS_TEST_TOKEN}` + "\n" + `b: "^\d+$"`)))
-	if !strings.Contains(got, "s3cret") {
-		t.Fatalf("variable not substituted: %s", got)
+	var got struct{ A, B string }
+	if err := decodeDocument([]byte(`a: ${ARGUS_TEST_TOKEN}`+"\n"+`b: '^\d+$'`), &got); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(got, `^\d+$`) {
-		t.Fatalf("regex was mangled: %s", got)
+	if got.A != "s3cret" {
+		t.Fatalf("variable not substituted: %q", got.A)
+	}
+	if got.B != `^\d+$` {
+		t.Fatalf("regex was mangled: %q", got.B)
 	}
 }
 

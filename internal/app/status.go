@@ -18,8 +18,11 @@ const (
 // which bytes it was. The hash lets the pusher tell whether the node is already
 // running what it would send.
 type ConfigMeta struct {
-	Source    string
-	Hash      string
+	Source string
+	Hash   string
+	// Document is the configuration as accepted, ${VAR} references unexpanded,
+	// so that reading it back reveals no secret taken from the environment.
+	Document  []byte
 	AppliedAt time.Time
 }
 

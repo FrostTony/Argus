@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/tonyamdfrost-cmd/Argus/internal/metrics"
+	"github.com/tonyamdfrost-cmd/Argus/internal/probe"
 )
 
 // The size is counted whether or not the body is kept.
@@ -21,6 +22,34 @@ func TestBodyIsKeptOnlyForValidatorsThatReadIt(t *testing.T) {
 		if got := newProber(t, options).(*Prober).keepBody; got != want {
 			t.Errorf("%q: keepBody = %v, want %v", options, got, want)
 		}
+	}
+}
+
+// A validator that reads the body would see an empty one.
+func TestBodyValidatorsNeedReadBody(t *testing.T) {
+	for _, v := range []string{`body_regex: ok`, `body_not_regex: down`, `json_path: status`} {
+		if _, err := options("read_body: false\nvalidators:\n  - " + v + "\n"); err == nil {
+			t.Errorf("%s accepted with read_body: false", v)
+		}
+	}
+}
+
+func TestMaxSizeHoldsWithoutReadBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(make([]byte, 10_000))
+	}))
+	defer srv.Close()
+
+	p := newProber(t, `
+read_body: false
+max_body_bytes: 1000
+validators:
+  - name: small
+    max_size_bytes: 5000
+`)
+	res := p.Probe(context.Background(), request(t, srv), metrics.NewRecorder(metrics.Labels{}))
+	if got := probe.ReasonOf(res.Err); got != probe.ReasonContent {
+		t.Fatalf("a 10000-byte body against max_size_bytes 5000: reason %q, want %q (err %v)", got, probe.ReasonContent, res.Err)
 	}
 }
 

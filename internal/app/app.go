@@ -39,15 +39,14 @@ type App struct {
 	closers   []func() error
 	reopeners []func() error
 
-	// applyMu serialises reloads end to end.
+	// applyMu serialises changes end to end: the apply, the save and the record.
 	applyMu sync.Mutex
 
 	mu     sync.Mutex
 	probes map[string]*running
 	order  []string
 	source config.Probes
-	// meta is where the running configuration came from; the API and the
-	// loader set it, /status reports it.
+	// meta is where the running configuration came from; /status reports it.
 	meta    ConfigMeta
 	rootCtx context.Context
 	live    sync.WaitGroup
@@ -64,8 +63,55 @@ type running struct {
 	// fingerprint and files decide whether a reload leaves the probe alone.
 	fingerprint string
 	files       string
-	cancel      context.CancelFunc
-	done        chan struct{}
+	// life ends when the probe leaves the configuration, and every run with it.
+	life context.Context
+	end  context.CancelFunc
+	done chan struct{} // closed when the scheduled loop exits; nil until started
+
+	mu       sync.Mutex
+	retired  bool
+	onDemand sync.WaitGroup
+}
+
+func newRunning(r *probe.Runner, fingerprint string) *running {
+	life, end := context.WithCancel(context.Background())
+	return &running{runner: r, fingerprint: fingerprint, files: digest(r.Prober), life: life, end: end}
+}
+
+// runNow is an on-demand run. It ends with the probe as well as with the
+// caller: one outliving a reload would write series the reload has dropped.
+func (r *running) runNow(ctx context.Context, sink metrics.Sink) bool {
+	r.mu.Lock()
+	if r.retired {
+		r.mu.Unlock()
+		return true // the probe is gone; there is nothing left to run
+	}
+	r.onDemand.Add(1)
+	r.mu.Unlock()
+	defer r.onDemand.Done()
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(r.life, cancel)
+	defer stop()
+	return r.runner.RunNow(ctx, sink)
+}
+
+// retire ends the probe's life; an on-demand run that has not started never will.
+func (r *running) retire() {
+	r.mu.Lock()
+	r.retired = true
+	r.mu.Unlock()
+	r.end()
+}
+
+// settle waits out every run of a retired probe. Cancellation is asynchronous,
+// and a run past its last check would publish after the caller drops its series.
+func (r *running) settle(done chan struct{}) {
+	r.onDemand.Wait()
+	if done != nil {
+		<-done
+	}
 }
 
 // Build assembles a node from its two configurations; nothing runs until Start.
@@ -140,8 +186,36 @@ func buildResolver(c config.Resolver) resolve.Resolver {
 
 // Reload swaps in a new check configuration, touching only what changed.
 func (a *App) Reload(probes config.Probes) error {
-	err := a.apply(probes)
-	if err != nil {
+	a.applyMu.Lock()
+	defer a.applyMu.Unlock()
+	return a.reload(probes)
+}
+
+// ErrNotSaved comes with the cause when a configuration was applied but could
+// not be saved.
+var ErrNotSaved = errors.New("the node is running this configuration but could not save it, so a restart will undo it")
+
+// Replace is Reload for a configuration that becomes the node's own: save, when
+// given, runs once the probes are running, and meta is recorded only after both.
+// Changes are serialised whole, so what is running, what is saved and what
+// /status reports cannot come from different changes.
+func (a *App) Replace(probes config.Probes, meta ConfigMeta, save func() error) error {
+	a.applyMu.Lock()
+	defer a.applyMu.Unlock()
+	if err := a.reload(probes); err != nil {
+		return err
+	}
+	if save != nil {
+		if err := save(); err != nil {
+			return fmt.Errorf("%w: %w", ErrNotSaved, err)
+		}
+	}
+	a.SetConfigMeta(meta)
+	return nil
+}
+
+func (a *App) reload(probes config.Probes) error {
+	if err := a.apply(probes); err != nil {
 		a.reloadNG.Add(1)
 		return err
 	}
@@ -150,10 +224,8 @@ func (a *App) Reload(probes config.Probes) error {
 }
 
 // apply installs a probe set, failing before any running probe is touched.
+// The caller holds applyMu, or is Build with nothing running yet.
 func (a *App) apply(probes config.Probes) error {
-	a.applyMu.Lock()
-	defer a.applyMu.Unlock()
-
 	list, err := probes.Resolve()
 	if err != nil {
 		return err
@@ -194,7 +266,7 @@ func (a *App) apply(probes config.Probes) error {
 		if old, ok := current[pc.Name]; ok {
 			r.Inherit(old.runner)
 		}
-		next[pc.Name] = &running{runner: r, fingerprint: fp, files: digest(r.Prober)}
+		next[pc.Name] = newRunning(r, fp)
 		order = append(order, pc.Name)
 	}
 	if len(next) == 0 {
@@ -212,12 +284,17 @@ func (a *App) apply(probes config.Probes) error {
 			starting = append(starting, r)
 		}
 	}
-	var gone []string
+	type leaving struct {
+		name string
+		r    *running
+		done chan struct{}
+	}
+	var gone []leaving
 	for name, old := range current {
 		if next[name] != old {
 			stopping = append(stopping, old)
 			if _, kept := next[name]; !kept {
-				gone = append(gone, name)
+				gone = append(gone, leaving{name, old, old.done})
 			}
 		}
 	}
@@ -230,13 +307,12 @@ func (a *App) apply(probes config.Probes) error {
 
 	// Replaced probes stop only after their successors are up.
 	for _, r := range stopping {
-		if r.cancel != nil {
-			r.cancel()
-		}
+		r.retire()
 	}
 	// A probe that left the configuration leaves /metrics with it.
-	for _, name := range gone {
-		a.Store.Drop(func(s metrics.Sample) bool { return s.Labels.Get("probe") == name })
+	for _, g := range gone {
+		g.r.settle(g.done)
+		a.Store.Drop(func(s metrics.Sample) bool { return s.Labels.Get("probe") == g.name })
 	}
 	if len(starting) > 0 || len(stopping) > 0 {
 		a.Log.Info("configuration applied",
@@ -245,13 +321,29 @@ func (a *App) apply(probes config.Probes) error {
 	return nil
 }
 
+// fingerprint identifies what a probe does; a comment in its options does nothing.
 func fingerprint(pc config.Probe) (string, error) {
+	pc.Options = uncommented(pc.Options)
 	data, err := yaml.Marshal(pc)
 	if err != nil {
 		return "", err
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// uncommented copies a node without its comments, leaving the original alone.
+func uncommented(n yaml.Node) yaml.Node {
+	n.HeadComment, n.LineComment, n.FootComment = "", "", ""
+	if len(n.Content) > 0 {
+		content := make([]*yaml.Node, len(n.Content))
+		for i, c := range n.Content {
+			c := uncommented(*c)
+			content[i] = &c
+		}
+		n.Content = content
+	}
+	return n
 }
 
 // digest is the state of the files a prober read, so a rotation rebuilds it.
@@ -391,7 +483,7 @@ func (a *App) startLocked(r *running) {
 		return
 	}
 	ctx, cancel := context.WithCancel(a.rootCtx)
-	r.cancel = cancel
+	stop := context.AfterFunc(r.life, cancel)
 	r.done = make(chan struct{})
 	a.live.Add(1)
 	a.alive.Add(1)
@@ -400,6 +492,8 @@ func (a *App) startLocked(r *running) {
 		defer a.live.Done()
 		defer a.alive.Add(-1)
 		defer close(r.done)
+		defer stop()
+		defer cancel()
 		var wg sync.WaitGroup
 		if d, ok := r.runner.Source.(*discovery.Dynamic); ok {
 			wg.Add(1)
@@ -425,11 +519,20 @@ func (a *App) Running() int64 { return a.alive.Load() }
 
 // Runners is the probes this node currently runs, in configuration order.
 func (a *App) Runners() []*probe.Runner {
+	current := a.current()
+	out := make([]*probe.Runner, 0, len(current))
+	for _, r := range current {
+		out = append(out, r.runner)
+	}
+	return out
+}
+
+func (a *App) current() []*running {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	out := make([]*probe.Runner, 0, len(a.order))
+	out := make([]*running, 0, len(a.order))
 	for _, name := range a.order {
-		out = append(out, a.probes[name].runner)
+		out = append(out, a.probes[name])
 	}
 	return out
 }
@@ -441,12 +544,13 @@ func (a *App) Probes() config.Probes {
 	return a.source
 }
 
-// SetConfigMeta records where the configuration now running came from. It is
-// set after a successful apply, so a rejected push leaves the old value alone.
-func (a *App) SetConfigMeta(source, hash string) {
+// SetConfigMeta records where the configuration now running came from, stamped
+// with the current time: for the one Build was given, as Replace does for a change.
+func (a *App) SetConfigMeta(meta ConfigMeta) {
+	meta.AppliedAt = time.Now()
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.meta = ConfigMeta{Source: source, Hash: hash, AppliedAt: time.Now()}
+	a.meta = meta
 }
 
 // ConfigMeta is what the node says about its current configuration.
@@ -459,12 +563,12 @@ func (a *App) ConfigMeta() ConfigMeta {
 // RunOnce runs one probe or all of them once, under the overlap guard.
 func (a *App) RunOnce(ctx context.Context, name string) error {
 	found, busy := false, 0
-	for _, r := range a.Runners() {
-		if name != "" && r.Name != name {
+	for _, r := range a.current() {
+		if name != "" && r.runner.Name != name {
 			continue
 		}
 		found = true
-		if !r.RunNow(ctx, a.Sink) {
+		if !r.runNow(ctx, a.Sink) {
 			busy++
 		}
 	}

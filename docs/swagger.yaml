@@ -266,8 +266,12 @@ paths:
       tags: [config]
       summary: Read the check configuration
       description: |
-        The configuration as loaded, not as resolved: templates and defaults are
-        still there, so what comes back can be sent straight back in.
+        The configuration as accepted, byte for byte: comments, templates and
+        defaults are still there and `${VAR}` references are not expanded, so a
+        read token sees no secret taken from the environment and what comes back
+        can be sent straight back in. A node started from several files answers
+        a YAML stream with one document per file, which `PUT` refuses: such a
+        configuration is edited on disk. Empty when there is none yet.
       security: [{readToken: []}]
       responses:
         "200":

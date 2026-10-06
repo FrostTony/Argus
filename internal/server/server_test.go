@@ -141,12 +141,16 @@ func TestConfigRoundTrips(t *testing.T) {
 	a := newApp(t)
 	ts := serve(t, a, nil)
 
+	const pushed = "# the comment stays\nprobes:\n  - {name: one, type: noop, targets: [\"1.1.1.1\"], noop: {}}\n"
+	if code, out := do(t, ts, http.MethodPut, "/api/config", "tok", pushed); code != http.StatusOK {
+		t.Fatalf("PUT: %d %s", code, out)
+	}
 	code, body := do(t, ts, http.MethodGet, "/api/config", "tok", "")
 	if code != http.StatusOK {
 		t.Fatalf("GET: %d", code)
 	}
-	if !strings.Contains(body, "one") {
-		t.Fatalf("running probe missing from the config:\n%s", body)
+	if body != pushed {
+		t.Fatalf("GET answers something other than what was accepted:\n%s", body)
 	}
 	if code, out := do(t, ts, http.MethodPut, "/api/config", "tok", body); code != http.StatusOK {
 		t.Fatalf("PUT of its own config: %d %s", code, out)

@@ -383,3 +383,13 @@ func writeFragment(w io.Writer, op opcode, payload []byte, final bool) error {
 	_, err := w.Write(payload)
 	return err
 }
+
+func TestFailedTLSHandshakeIsAFailureNotAPanic(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	defer srv.Close()
+	// The test server's certificate is self-signed, so verification fails.
+	res, _ := run(t, build(t, "tls: true\n"), request(t, srv))
+	if got := probe.ReasonOf(res.Err); got != probe.ReasonTLS {
+		t.Fatalf("reason = %q, want %q (err %v)", got, probe.ReasonTLS, res.Err)
+	}
+}

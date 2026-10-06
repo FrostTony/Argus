@@ -1,6 +1,8 @@
 package server
 
 import (
+	"encoding/json"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -38,14 +40,14 @@ type targetData struct {
 	declared int
 	counted  bool
 
-	Target  string  `json:"target"`
-	Up      int     `json:"up"`
-	Total   int     `json:"total"`
-	Resolve float64 `json:"resolve,omitempty"`
+	Target  string `json:"target"`
+	Up      int    `json:"up"`
+	Total   int    `json:"total"`
+	Resolve number `json:"resolve,omitempty"`
 	// Error is set when the target never got as far as a backend.
-	Error    string             `json:"error,omitempty"`
-	Stats    map[string]float64 `json:"stats,omitempty"`
-	Backends []backendData      `json:"backends"`
+	Error    string            `json:"error,omitempty"`
+	Stats    map[string]number `json:"stats,omitempty"`
+	Backends []backendData     `json:"backends"`
 }
 
 // backendData carries every metric the probe recorded for one address.
@@ -58,13 +60,13 @@ type backendData struct {
 	Up      bool   `json:"up"`
 	Reason  string `json:"reason,omitempty"`
 	// Error is the message behind the failure; Reason is only its category.
-	Error   string  `json:"error,omitempty"`
-	Latency float64 `json:"latency,omitempty"`
-	Age     float64 `json:"age,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Latency number `json:"latency,omitempty"`
+	Age     number `json:"age,omitempty"`
 
-	Phases   map[string]float64  `json:"phases,omitempty"`
-	Gauges   map[string]float64  `json:"gauges,omitempty"`
-	Counters map[string]float64  `json:"counters,omitempty"`
+	Phases   map[string]number   `json:"phases,omitempty"`
+	Gauges   map[string]number   `json:"gauges,omitempty"`
+	Counters map[string]number   `json:"counters,omitempty"`
 	Info     map[string]string   `json:"info,omitempty"`
 	Hist     map[string]histData `json:"hist,omitempty"`
 }
@@ -72,10 +74,22 @@ type backendData struct {
 // histData is a histogram summarised without its buckets; a bucketless one
 // has no percentiles to give.
 type histData struct {
-	Count uint64  `json:"count"`
-	Mean  float64 `json:"mean"`
-	P50   float64 `json:"p50,omitempty"`
-	P95   float64 `json:"p95,omitempty"`
+	Count uint64 `json:"count"`
+	Mean  number `json:"mean"`
+	P50   number `json:"p50,omitempty"`
+	P95   number `json:"p95,omitempty"`
+}
+
+// number is a measurement as the page reads it. A gauge may hold NaN or ±Inf,
+// which JSON cannot carry: those go out as null instead of failing the snapshot.
+type number float64
+
+func (n number) MarshalJSON() ([]byte, error) {
+	f := float64(n)
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return []byte("null"), nil
+	}
+	return json.Marshal(f)
 }
 
 // Series the page reads by name, each driving a field of its own.
@@ -223,16 +237,16 @@ func absorbTarget(td *targetData, sm metrics.Sample) {
 			td.declared, td.counted = int(v), true
 			return
 		case mResolve:
-			td.Resolve = float64(v)
+			td.Resolve = number(v)
 			return
 		}
-		set(&td.Stats, sm.Name, float64(v))
+		set(&td.Stats, sm.Name, number(v))
 	case metrics.Counter:
-		set(&td.Stats, sm.Name, float64(v))
+		set(&td.Stats, sm.Name, number(v))
 	case *metrics.Dist:
 		if sm.Name == probe.TimeResolve.Hist() {
-			set(&td.Stats, "resolve_mean", v.Mean())
-			set(&td.Stats, "resolve_p95", v.Quantile(0.95))
+			set(&td.Stats, "resolve_mean", number(v.Mean()))
+			set(&td.Stats, "resolve_p95", number(v.Quantile(0.95)))
 		}
 	}
 }
@@ -245,21 +259,21 @@ func absorb(bd *backendData, sm metrics.Sample) {
 		case mUp:
 			bd.Up, bd.live = v == 1, true
 		case mLast:
-			bd.Latency = float64(v)
+			bd.Latency = number(v)
 		case mPhase:
-			set(&bd.Phases, sm.Labels.Get("phase"), float64(v))
+			set(&bd.Phases, sm.Labels.Get("phase"), number(v))
 		case "tls_cert_expiry_days":
-			bd.Age = float64(v)
-			set(&bd.Gauges, sm.Name, float64(v))
+			bd.Age = number(v)
+			set(&bd.Gauges, sm.Name, number(v))
 		default:
-			set(&bd.Gauges, trimLast(sm.Name), float64(v))
+			set(&bd.Gauges, trimLast(sm.Name), number(v))
 		}
 	case metrics.Counter:
 		key := sm.Name
 		if r := sm.Labels.Get("reason"); r != "" {
 			key += " (" + r + ")"
 		}
-		set(&bd.Counters, key, float64(v))
+		set(&bd.Counters, key, number(v))
 	case metrics.Info:
 		set(&bd.Info, sm.Name, string(v))
 	case *metrics.Dist:
@@ -273,9 +287,9 @@ func absorb(bd *backendData, sm metrics.Sample) {
 		if r := sm.Labels.Get("resolver"); r != "" {
 			name += ":" + r
 		}
-		h := histData{Count: v.Count, Mean: v.Mean()}
+		h := histData{Count: v.Count, Mean: number(v.Mean())}
 		if v.HasBuckets() {
-			h.P50, h.P95 = v.Quantile(0.5), v.Quantile(0.95)
+			h.P50, h.P95 = number(v.Quantile(0.5)), number(v.Quantile(0.95))
 		}
 		bd.Hist[name] = h
 	}

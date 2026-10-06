@@ -372,3 +372,11 @@ expect: "^250 "
 	}
 	t.Fatal("tcp_response_size_bytes is missing from a failed conversation")
 }
+
+func TestFailedTLSHandshakeIsAFailureNotAPanic(t *testing.T) {
+	host, port := serve(t, script{greet: "not tls at all\r\n\r\n"})
+	res, _ := run(t, newProber(t, "tls: true\n"), host, port)
+	if got := probe.ReasonOf(res.Err); got != probe.ReasonTLS {
+		t.Fatalf("reason = %q, want %q (err %v)", got, probe.ReasonTLS, res.Err)
+	}
+}

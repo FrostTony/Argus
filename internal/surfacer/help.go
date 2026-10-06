@@ -61,6 +61,7 @@ var help = map[string]string{
 	"domain_registrar_info":             "The registrar holding the domain, as a label.",
 	"domain_status_info":                "The registry status codes, as a label.",
 	"domain_lookup_duration_seconds":    "Time the registry took to answer.",
+	"domain_fetched_seconds":            "When the registry gave the answer in use, as a unix timestamp.",
 	"argus_discovery_failures":          "Failed discovery refreshes since the agent started.",
 	"argus_discovery_age_seconds":       "How long the served target list has been standing.",
 	"resolve_fallback_total":            "Resolutions answered by the other address family.",
