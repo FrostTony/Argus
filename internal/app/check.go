@@ -190,6 +190,11 @@ func (a *App) checkConfig(req CheckRequest) (config.Probe, error) {
 		return pc, fmt.Errorf("name a probe or supply a definition")
 	}
 
+	// /probe on a scrape, /api/check on a whim: neither is a reason to upload
+	// a video, and neither waits long enough for one.
+	if pc.Type == config.ScenarioType {
+		return pc, ScenarioOnDemand(pc.Name)
+	}
 	if req.Target != "" {
 		var t config.Target
 		if err := t.Parse(req.Target); err != nil {

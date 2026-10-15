@@ -77,7 +77,7 @@ type Prober struct {
 	readBody bool
 	keepBody bool
 	maxBody  int64
-	// sizeLimit must reach past the largest max_size_bytes or that validator can never fail.
+	// sizeLimit must reach past the largest size bound, or that validator cannot decide.
 	sizeLimit  int64
 	tlsConfig  *tls.Config
 	validators []Validator
@@ -106,7 +106,7 @@ func New(pc config.Probe) (probe.Prober, error) {
 
 	vs := cfg.Validators
 	if len(vs) == 0 {
-		vs = []Validator{{Name: "status", StatusCode: []string{"200-399"}}}
+		vs = []Validator{DefaultValidator()}
 	}
 	if p.cfg.Path != "" {
 		u, err := url.Parse(p.cfg.Path)
@@ -121,14 +121,14 @@ func New(pc config.Probe) (probe.Prober, error) {
 		p.sizeLimit = p.maxBody
 	}
 	for i := range vs {
-		if err := vs[i].compile(); err != nil {
+		if err := vs[i].Compile(); err != nil {
 			return nil, fmt.Errorf("validators[%d]: %w", i, err)
 		}
-		if !p.readBody && vs[i].readsBody() {
+		if !p.readBody && vs[i].ReadsBody() {
 			return nil, fmt.Errorf("validators[%d]: body_regex, body_not_regex and json_path need the body, and read_body is false", i)
 		}
-		p.keepBody = p.keepBody || vs[i].readsBody()
-		p.sizeLimit = max(p.sizeLimit, vs[i].MaxSizeBytes+1)
+		p.keepBody = p.keepBody || vs[i].ReadsBody()
+		p.sizeLimit = max(p.sizeLimit, vs[i].MaxSizeBytes+1, vs[i].MinSizeBytes)
 	}
 	p.validators = vs
 
@@ -227,7 +227,7 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 
 	client, conns := p.client(req, u)
 	// An HTTP/2 stream aborted by the deadline leaves a connection that is not idle.
-	defer conns.closeAll()
+	defer conns.CloseAll()
 
 	// The token comes from elsewhere; its time is not the target's.
 	authStart := time.Now()
@@ -279,11 +279,11 @@ func (p *Prober) tokenTimeout(ctx context.Context) time.Duration {
 }
 
 // client pins one backend at DialContext, leaving Host, SNI and verification on the domain.
-func (p *Prober) client(req probe.Request, u *url.URL) (*http.Client, *connSet) {
+func (p *Prober) client(req probe.Request, u *url.URL) (*http.Client, *probe.Conns) {
 	b := req.Backend
 	origin := asciiHost(u.Hostname())
 	dialer := req.Dialer("tcp")
-	conns := &connSet{}
+	conns := &probe.Conns{}
 	tlsCfg := p.tlsConfig.Clone()
 	if tlsCfg.ServerName == "" && req.Hostname != "" {
 		tlsCfg.ServerName = req.Hostname
@@ -298,7 +298,7 @@ func (p *Prober) client(req probe.Request, u *url.URL) (*http.Client, *connSet) 
 			if b.Valid() && sameHost(addr, origin) {
 				addr = pin(addr, b)
 			}
-			return conns.dial(ctx, dialer, network, addr)
+			return conns.Dial(ctx, dialer, network, addr)
 		},
 	}
 	if p.proxy != nil {
@@ -342,30 +342,6 @@ func (p *Prober) client(req probe.Request, u *url.URL) (*http.Client, *connSet) 
 	return c, conns
 }
 
-// connSet holds the connections one check opened, to close them all when it ends.
-type connSet struct {
-	mu    sync.Mutex
-	conns []net.Conn
-}
-
-func (s *connSet) dial(ctx context.Context, d *net.Dialer, network, addr string) (net.Conn, error) {
-	c, err := d.DialContext(ctx, network, addr)
-	if err == nil {
-		s.mu.Lock()
-		s.conns = append(s.conns, c)
-		s.mu.Unlock()
-	}
-	return c, err
-}
-
-func (s *connSet) closeAll() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, c := range s.conns {
-		_ = c.Close()
-	}
-}
-
 // asciiHost is the host as the transport dials it: IDNA ASCII for a Unicode name.
 func asciiHost(host string) string {
 	if ascii, err := idna.Lookup.ToASCII(host); err == nil {
@@ -396,28 +372,14 @@ func pin(addr string, b probe.Backend) string {
 
 // targetURL builds the request address; the probe's path overrides the target's.
 func (p *Prober) targetURL(t probe.Target) (*url.URL, error) {
-	var u url.URL
-	switch {
-	case t.URL != nil:
-		u = *t.URL
-	case t.Host == "":
-		return nil, fmt.Errorf("target has neither url nor host")
-	default:
-		u = url.URL{Scheme: "https", Host: t.Host, Path: "/"}
-		if strings.Contains(t.Host, ":") {
-			u.Host = "[" + t.Host + "]" // an IPv6 literal
-		}
-		switch {
-		case t.Port == 80:
-			u.Scheme = "http"
-		case t.Port != 0 && t.Port != 443:
-			u.Host = net.JoinHostPort(t.Host, strconv.Itoa(t.Port))
-		}
+	u, err := t.HTTPURL()
+	if err != nil {
+		return nil, err
 	}
 	if p.path != nil {
 		u.Path, u.RawPath, u.RawQuery = p.path.Path, p.path.RawPath, p.path.RawQuery
 	}
-	return &u, nil
+	return u, nil
 }
 
 func (p *Prober) buildRequest(ctx context.Context, u *url.URL, t *timings) (*http.Request, error) {

@@ -29,7 +29,7 @@ func TestTheStateFileWinsOverTheFiles(t *testing.T) {
 	files := writeFile(t, dir, "checks.yaml", validProbes)
 	state := writeFile(t, dir, "pushed.yaml", pushedProbes)
 
-	ck, err := loadChecks(&flags{probes: multiFlag{files}, state: state}, quietLog(), true)
+	ck, err := loadProbes(&flags{probes: multiFlag{files}, state: state}, quietLog(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +53,7 @@ func TestAnUnusableStateFileFallsBackToTheFiles(t *testing.T) {
 	files := writeFile(t, dir, "checks.yaml", validProbes)
 	state := writeFile(t, dir, "pushed.yaml", "probes: [{name: x, type: nosuchkind}]\n")
 
-	ck, err := loadChecks(&flags{probes: multiFlag{files}, state: state}, quietLog(), true)
+	ck, err := loadProbes(&flags{probes: multiFlag{files}, state: state}, quietLog(), true)
 	if err != nil {
 		t.Fatalf("a broken state file must not stop the node: %v", err)
 	}
@@ -69,7 +69,7 @@ func TestAnUnusableStateFileFallsBackToTheFiles(t *testing.T) {
 func TestANodeWithOnlyAStateFileStartsEmpty(t *testing.T) {
 	state := filepath.Join(t.TempDir(), "state", "pushed.yaml")
 
-	ck, err := loadChecks(&flags{state: state}, quietLog(), true)
+	ck, err := loadProbes(&flags{state: state}, quietLog(), true)
 	if err != nil {
 		t.Fatalf("a node waiting for its first push must still start: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestThePersisterWritesTheStateFileAndItsDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ck, err := loadChecks(&flags{state: state}, quietLog(), true)
+	ck, err := loadProbes(&flags{state: state}, quietLog(), true)
 	if err != nil {
 		t.Fatalf("the node cannot start from what it saved: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestMissingCheckFilesAreNotFatalWithAStateFile(t *testing.T) {
 	dir := t.TempDir()
 	// The node is driven by the API and the probes directory was never filled:
 	// starting empty beats a crash loop until the first push arrives.
-	ck, err := loadChecks(&flags{
+	ck, err := loadProbes(&flags{
 		probes: multiFlag{filepath.Join(dir, "probes.d")},
 		state:  filepath.Join(dir, "pushed.yaml"),
 	}, quietLog(), true)
@@ -147,7 +147,7 @@ func TestMissingCheckFilesAreNotFatalWithAStateFile(t *testing.T) {
 	if ck.meta.Source != app.SourceNone {
 		t.Fatalf("source is %q, want none", ck.meta.Source)
 	}
-	if _, err := loadChecks(&flags{probes: multiFlag{filepath.Join(dir, "probes.d")}}, quietLog(), true); err == nil {
+	if _, err := loadProbes(&flags{probes: multiFlag{filepath.Join(dir, "probes.d")}}, quietLog(), true); err == nil {
 		t.Fatal("without a state file, unreadable check files are still an error")
 	}
 }

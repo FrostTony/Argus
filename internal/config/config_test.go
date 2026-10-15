@@ -369,6 +369,8 @@ func TestEveryProbeFieldIsNamed(t *testing.T) {
 		switch {
 		case f.Name == "Options":
 			continue // the prober's own block, held as a raw node
+		case f.Name == "Dir":
+			continue // where the file is, which no file says about itself
 		case f.Anonymous:
 			t.Errorf("%s is embedded, so its keys would be read as a prober block", f.Name)
 		case name == "" || name == "-":

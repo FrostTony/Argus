@@ -15,7 +15,7 @@ func TestBrokenFilesFailTheReload(t *testing.T) {
 	files := writeFile(t, dir, "checks.yaml", validProbes)
 	f := &flags{probes: multiFlag{files}, state: filepath.Join(dir, "state.yaml")}
 
-	ck, err := loadChecks(f, discard(), true)
+	ck, err := loadProbes(f, discard(), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -26,7 +26,7 @@ func TestBrokenFilesFailTheReload(t *testing.T) {
 	a.SetConfigMeta(ck.meta)
 	writeFile(t, dir, "checks.yaml", validProbes+"    intervl: 5s\n")
 
-	if err := reloader(f, a, discard())(); err == nil {
+	if err := reloader(f, nil, a, discard())(); err == nil {
 		t.Fatal("a reload from a broken file succeeded")
 	}
 	if n := len(a.Runners()); n != 1 {
@@ -36,7 +36,7 @@ func TestBrokenFilesFailTheReload(t *testing.T) {
 		t.Fatalf("the failed reload recorded source %q", got)
 	}
 	// At startup the same files leave the node waiting for a push.
-	if ck, err := loadChecks(f, discard(), true); err != nil || ck.meta.Source != app.SourceNone {
+	if ck, err := loadProbes(f, discard(), true); err != nil || ck.meta.Source != app.SourceNone {
 		t.Fatalf("source=%q err=%v", ck.meta.Source, err)
 	}
 }
@@ -44,7 +44,7 @@ func TestBrokenFilesFailTheReload(t *testing.T) {
 func TestBrokenStateFailsTheReload(t *testing.T) {
 	dir := t.TempDir()
 	state := writeFile(t, dir, "state.yaml", validProbes+"    intervl: 5s\n")
-	if _, err := loadChecks(&flags{state: state}, discard(), false); err == nil {
+	if _, err := loadProbes(&flags{state: state}, discard(), false); err == nil {
 		t.Fatal("a reload from a broken state file and no files succeeded")
 	}
 }

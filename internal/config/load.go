@@ -30,6 +30,7 @@ func LoadServer(path string) (Server, error) {
 		if err := decodeDocument(data, &cfg); err != nil {
 			return cfg, fmt.Errorf("%s: %w", path, err)
 		}
+		cfg.Scenarios.anchor(filepath.Dir(path))
 	}
 	if err := cfg.Validate(); err != nil {
 		return cfg, fmt.Errorf("%s: %w", cmp.Or(path, "<defaults>"), err)

@@ -106,6 +106,11 @@ var help = map[string]string{
 	"grpc_status_info":           "The gRPC status code, as a label.",
 	"external_exit_code":         "Exit status of the command.",
 	"external_metrics_parsed":    "Metric lines accepted from the command's output.",
+	"scenario_step_success":      "Whether a scenario step passed, by step; a step the run did not reach has none.",
+	"scenario_step_status_code":  "HTTP status code of a scenario step's last answer.",
+	"scenario_step_attempts":     "Requests a waiting step made before until held or it gave up.",
+	"scenario_value":             "A number a scenario step extracted with metric: true, by step and name.",
+	"scenario_cleanup_success":   "Whether every cleanup step that had something to clean up passed.",
 
 	// blackbox_exporter's names, which /probe publishes alongside the node's
 	// own. Documented under the meaning blackbox gives them.

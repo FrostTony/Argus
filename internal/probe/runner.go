@@ -68,10 +68,9 @@ type Runner struct {
 	// keep only the reason.
 	Observe func(req Request, err error)
 
-	inFlight atomic.Bool
-	skipped  atomic.Int64
-	panics   atomic.Int64
-	paused   atomic.Int64
+	skipped atomic.Int64
+	panics  atomic.Int64
+	paused  atomic.Int64
 
 	once   sync.Once
 	health *health
@@ -88,10 +87,13 @@ func (r *Runner) state() *health {
 	return r.health
 }
 
-// Inherit continues from what the runner a reload replaces knew. Call it before
-// the first run.
+// Inherit continues from what the runner a reload replaces knew, its prober's
+// state included when the prober keeps any. Call it before the first run.
 func (r *Runner) Inherit(old *Runner) {
 	r.once.Do(func() { r.health = old.state() })
+	if h, ok := r.Prober.(Heir); ok {
+		h.Inherit(old.Prober)
+	}
 }
 
 // Skipped counts runs dropped because the previous one was still going.
@@ -115,6 +117,13 @@ func (r *Runner) Start(ctx context.Context, sink metrics.Sink, jitter float64) {
 			return
 		}
 	}
+	// A reload hands on the last run of the probe this one replaced. It is
+	// cancelled and ends soon — a scenario's cleanup aside — and the first run
+	// here waits for it rather than skipping, which would leave the changed
+	// probe without a result for a whole interval.
+	if !r.enter(ctx) {
+		return
+	}
 	t := time.NewTicker(r.Interval)
 	defer t.Stop()
 
@@ -123,21 +132,21 @@ func (r *Runner) Start(ctx context.Context, sink metrics.Sink, jitter float64) {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
-	run := func() {
+	run := func(held bool) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r.tick(ctx, sink)
+			r.tick(ctx, sink, held)
 		}()
 	}
 
-	run()
+	run(true)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			run()
+			run(false)
 		}
 	}
 }
@@ -145,27 +154,71 @@ func (r *Runner) Start(ctx context.Context, sink metrics.Sink, jitter float64) {
 // RunNow runs immediately unless a run is in progress, and reports whether it
 // ran: on-demand runs share health state with the scheduled ones.
 func (r *Runner) RunNow(ctx context.Context, sink metrics.Sink) bool {
-	if !r.inFlight.CompareAndSwap(false, true) {
+	if !r.tryEnter() {
 		return false
 	}
-	defer r.inFlight.Store(false)
+	defer r.leave()
 	r.RunOnce(ctx, sink)
 	return true
 }
 
-// tick skips the run when the previous one is still going.
-func (r *Runner) tick(ctx context.Context, sink metrics.Sink) {
+// Go starts a run in the background unless one is in progress, and reports
+// whether it did; done is called once the run has ended. It is RunNow for a
+// run that lasts longer than whoever asked for it is willing to wait.
+func (r *Runner) Go(ctx context.Context, sink metrics.Sink, done func()) bool {
+	if !r.tryEnter() {
+		return false
+	}
+	go func() {
+		defer done()
+		defer r.leave()
+		r.RunOnce(ctx, sink)
+	}()
+	return true
+}
+
+// Busy reports whether a run is in progress.
+func (r *Runner) Busy() bool { return len(r.state().slot) > 0 }
+
+// tryEnter takes the run slot if nothing holds it.
+func (r *Runner) tryEnter() bool {
+	select {
+	case r.state().slot <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// enter waits for the run slot, or for the context to end.
+func (r *Runner) enter(ctx context.Context) bool {
+	select {
+	case r.state().slot <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (r *Runner) leave() { <-r.state().slot }
+
+// tick skips the run when the previous one is still going. held says the
+// slot was already taken for it.
+func (r *Runner) tick(ctx context.Context, sink metrics.Sink, held bool) {
 	if !r.Schedule.Active(time.Now()) {
+		if held {
+			r.leave()
+		}
 		r.paused.Add(1)
 		return
 	}
-	if !r.inFlight.CompareAndSwap(false, true) {
+	if !held && !r.tryEnter() {
 		r.skipped.Add(1)
 		r.Log.Warn("previous run still in progress, skipping",
 			"probe", r.Name, "interval", r.Interval, "skipped_total", r.skipped.Load())
 		return
 	}
-	defer r.inFlight.Store(false)
+	defer r.leave()
 	r.RunOnce(ctx, sink)
 }
 

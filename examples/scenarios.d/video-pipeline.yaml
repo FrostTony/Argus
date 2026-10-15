@@ -1,0 +1,94 @@
+# A scenario: one file, one walk through a service the way a user takes it.
+#
+# The admin of a video platform: log in, see the list, upload a clip, wait for
+# it to be converted, play it, comment on it — and remove what the run left
+# behind. A single request proves the API answers; the queue, the converters
+# and the storage behind it can be stopped while every endpoint still says 200,
+# and only walking through shows that.
+#
+# Everything about when and where it runs is a probe's option, written the
+# way probes.d writes it. Everything else is the scenario. It takes nothing
+# from probes.d's defaults: a default made for one-request checks would cut a
+# minutes-long run short, so interval and timeout are required here.
+#
+# A host only you have: disabled until pointed at your own admin.
+disabled: true
+
+interval: 15m
+# The steps' budget, the wait for the conversion included. Cleanup has its own
+# (cleanup_timeout below), and timeout + cleanup_timeout must fit the interval.
+timeout: 8m
+# Every node that runs a scenario uploads a video. One is usually enough.
+run_on: ^msk-1$
+labels:
+  team: video
+targets:
+  - https://admin.video.example/
+
+# Read on every run, so rotating it needs no reload, and replaced by its
+# reference — ${secret.password} — in every error and report. env: NAME reads
+# an environment variable instead of a file.
+secrets:
+  password: {file: /run/secrets/argus-video-admin}
+
+# Plain values the steps start with.
+vars:
+  login: argus-synthetic
+
+cleanup_timeout: 1m
+
+steps:
+  # A session is one client: the cookie this sets is sent by every step after.
+  - name: login
+    http:
+      path: /api/login
+      json: {login: "${var.login}", password: "${secret.password}"}
+    expect: [{status_code: [200]}]
+
+  # metric: true publishes the number as scenario_value{name="videos"} — for
+  # a graph, not an assertion: a list that keeps changing is what it is for.
+  - name: list
+    http: {path: /api/videos}
+    extract:
+      videos: {json_path: total, metric: true}
+
+  # Files are named in the configuration — relative to this file — and
+  # streamed from disk with their length announced up front. ${run.id} tells
+  # one run's leftovers from another's.
+  - name: upload
+    http:
+      path: /api/videos
+      multipart:
+        fields: {title: "argus ${run.id}"}
+        files: {video: fixtures/sample.mp4}
+    expect: [{status_code: [201]}]
+    extract:
+      video_id: {json_path: id}
+
+  # Asked again every 10s until it is ready: the step's duration,
+  # probe_phase_last_duration_seconds{phase="convert"}, is the conversion time.
+  # abort_if ends the wait at once when the answer cannot get better.
+  - name: convert
+    http: {path: "/api/videos/${var.video_id}"}
+    until: [{json_path: status, json_equals: ready}]
+    abort_if: [{json_path: status, json_equals: failed}]
+    every: 10s
+    within: 5m
+
+  - name: playback
+    http: {path: "/hls/${var.video_id}/master.m3u8"}
+    expect: [{status_code: [200], body_regex: "^#EXTM3U"}]
+
+  - name: comment
+    http:
+      path: "/api/videos/${var.video_id}/comments"
+      json: {text: "argus ${run.id}"}
+    expect: [{status_code: [201]}]
+
+# Runs however the steps ended, under its own deadline. A step that needs a
+# variable no step got as far as setting — the upload failed, so there is no
+# video_id — is skipped rather than failed.
+cleanup:
+  - name: delete
+    http: {method: DELETE, path: "/api/videos/${var.video_id}"}
+    expect: [{status_code: ["200-299"]}]

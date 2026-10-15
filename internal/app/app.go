@@ -81,20 +81,31 @@ func newRunning(r *probe.Runner, fingerprint string) *running {
 // runNow is an on-demand run. It ends with the probe as well as with the
 // caller: one outliving a reload would write series the reload has dropped.
 func (r *running) runNow(ctx context.Context, sink metrics.Sink) bool {
-	r.mu.Lock()
-	if r.retired {
-		r.mu.Unlock()
+	ctx, leave, ok := r.enter(ctx)
+	if !ok {
 		return true // the probe is gone; there is nothing left to run
 	}
-	r.onDemand.Add(1)
-	r.mu.Unlock()
-	defer r.onDemand.Done()
-
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	stop := context.AfterFunc(r.life, cancel)
-	defer stop()
+	defer leave()
 	return r.runner.RunNow(ctx, sink)
+}
+
+// enter registers an on-demand run, which settle then waits for, and bounds
+// its context by the probe's life. It refuses once the probe is retired: a
+// run that has not started by then never will.
+func (r *running) enter(ctx context.Context) (context.Context, func(), bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.retired {
+		return ctx, nil, false
+	}
+	r.onDemand.Add(1)
+	ctx, cancel := context.WithCancel(ctx)
+	stop := context.AfterFunc(r.life, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+		r.onDemand.Done()
+	}, true
 }
 
 // retire ends the probe's life; an on-demand run that has not started never will.
@@ -309,7 +320,9 @@ func (a *App) apply(probes config.Probes) error {
 	for _, r := range stopping {
 		r.retire()
 	}
-	// A probe that left the configuration leaves /metrics with it.
+	// A probe that left the configuration leaves /metrics with it, once its
+	// last run is over: dropped any earlier, the series would be written back.
+	// For a scenario that includes its cleanup, which a reload waits out.
 	for _, g := range gone {
 		g.r.settle(g.done)
 		a.Store.Drop(func(s metrics.Sample) bool { return s.Labels.Get("probe") == g.name })
@@ -560,11 +573,15 @@ func (a *App) ConfigMeta() ConfigMeta {
 	return a.meta
 }
 
-// RunOnce runs one probe or all of them once, under the overlap guard.
+// RunOnce runs one probe or all of them once, under the overlap guard. All of
+// them leaves the scenarios out: one changes the target, and has to be named.
 func (a *App) RunOnce(ctx context.Context, name string) error {
 	found, busy := false, 0
 	for _, r := range a.current() {
 		if name != "" && r.runner.Name != name {
+			continue
+		}
+		if name == "" && r.runner.Kind == config.ScenarioType {
 			continue
 		}
 		found = true
@@ -573,8 +590,10 @@ func (a *App) RunOnce(ctx context.Context, name string) error {
 		}
 	}
 	switch {
+	case !found && name == "":
+		return fmt.Errorf("%w: no probe to run here, and a scenario runs only when named", ErrNotFound)
 	case !found:
-		return fmt.Errorf("probe %q not found", name)
+		return fmt.Errorf("%w: probe %q", ErrNotFound, name)
 	case busy > 0:
 		return fmt.Errorf("%w: %d probe(s) already running", ErrBusy, busy)
 	}

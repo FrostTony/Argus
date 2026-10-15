@@ -27,6 +27,10 @@ type Probes struct {
 	Defaults  Probe            `yaml:"defaults"`
 	Templates map[string]Probe `yaml:"templates"`
 	List      []Probe          `yaml:"probes"`
+	// Scenarios come from files of their own (see LoadScenarios), never from
+	// this document. They take nothing from Defaults: a default made for
+	// one-request checks would quietly cut a minutes-long scenario short.
+	Scenarios []Probe `yaml:"-"`
 }
 
 // Probe holds the prober's own parameters under a key named after its type
@@ -67,6 +71,9 @@ type Probe struct {
 	RunOn string `yaml:"run_on,omitempty"`
 
 	Options yaml.Node `yaml:"-"`
+	// Dir is the directory of the file the probe was read from, when it has
+	// a file of its own: a scenario's fixtures are named relative to it.
+	Dir string `yaml:"-"`
 }
 
 // probeFields are the keys a probe answers to itself; anything else is the
@@ -329,8 +336,12 @@ func (p *Probes) Resolve() ([]Probe, error) {
 		}
 		merged = merged.mergeFrom(probe)
 
-		if merged.Type == "" {
+		switch merged.Type {
+		case "":
 			return nil, fmt.Errorf("probes[%d] (%s): probe type is missing", i, probe.Name)
+		case ScenarioType:
+			return nil, fmt.Errorf("probes[%d] (%s): a scenario is a file of its own, "+
+				"in a directory listed under scenarios.paths in argus.yaml", i, probe.Name)
 		}
 		if merged.Targets.Empty() {
 			return nil, fmt.Errorf("probes[%d] (%s): targets are missing", i, probe.Name)
@@ -339,6 +350,12 @@ func (p *Probes) Resolve() ([]Probe, error) {
 			return nil, fmt.Errorf("probes[%d] (%s): %w", i, probe.Name, err)
 		}
 		out = append(out, merged)
+	}
+	for _, sc := range p.Scenarios {
+		if prev, dup := seen[sc.Name]; dup {
+			return nil, fmt.Errorf("scenario %q: the name is already used by probes[%d]", sc.Name, prev)
+		}
+		out = append(out, sc)
 	}
 	return out, nil
 }
@@ -430,6 +447,7 @@ func (p Probe) mergeFrom(other Probe) Probe {
 		res.Options = other.Options
 	}
 	res.Labels = mergeLabels(p.Labels, other.Labels)
+	res.Dir = cmp.Or(other.Dir, p.Dir)
 	return res
 }
 

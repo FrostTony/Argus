@@ -100,6 +100,15 @@ surfacers:
   #     basic_auth_pass: ${VM_PASSWORD}
   #     max_retries: 3
 
+# Scenarios: multi-step checks that act on a service the way a user does — log
+# in, upload, wait for the result, use it, clean up. One per file, apart from
+# probes.d because they change things on the target and run for minutes. A
+# relative path is taken from this file's directory. GET /api/scenarios shows
+# how each one's last run went, step by step; POST /api/scenarios/NAME/run
+# starts one off its schedule.
+scenarios:
+  paths: [scenarios.d]
+
 logging:
   # debug: every check; info: lifecycle and changes of state; warn: degradation;
   # error: what needs a person.

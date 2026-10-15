@@ -32,6 +32,7 @@ import (
 	_ "github.com/tonyamdfrost-cmd/Argus/internal/probe/grpc"
 	_ "github.com/tonyamdfrost-cmd/Argus/internal/probe/http"
 	_ "github.com/tonyamdfrost-cmd/Argus/internal/probe/icmp"
+	_ "github.com/tonyamdfrost-cmd/Argus/internal/probe/scenario"
 	_ "github.com/tonyamdfrost-cmd/Argus/internal/probe/tcp"
 	_ "github.com/tonyamdfrost-cmd/Argus/internal/probe/tlsprobe"
 	_ "github.com/tonyamdfrost-cmd/Argus/internal/probe/udp"
@@ -64,7 +65,10 @@ argus ` + version + ` - active monitoring for domains
 It outlives a restart and wins over -probes, so a pushed node comes back with
 what it was pushed and not with what is on disk.
 
-SIGHUP reloads the check configuration in place.
+Scenarios are read from the paths under scenarios: in argus.yaml, whatever
+the checks come from.
+
+SIGHUP reloads the check configuration and the scenarios in place.
 `)
 }
 
@@ -109,6 +113,9 @@ type flags struct {
 type checks struct {
 	probes config.Probes
 	meta   app.ConfigMeta
+	// scenarios fingerprints the scenario files as they were before being read,
+	// so a change made while they were is still seen as one.
+	scenarios string
 }
 
 type multiFlag []string
@@ -149,7 +156,7 @@ func load(f *flags) (config.Server, checks, *slog.Logger, error) {
 	if err != nil {
 		return srv, checks{}, nil, err
 	}
-	ck, err := loadChecks(f, log, true)
+	ck, err := loadChecks(f, srv.Scenarios.Paths, log, true)
 	return srv, ck, log, err
 }
 
@@ -161,7 +168,24 @@ func load(f *flags) (config.Server, checks, *slog.Logger, error) {
 // With nothing usable a node starts empty and waits for a push. A reload in the
 // same position fails instead: replacing a running configuration with nothing
 // would stop every probe over a typo.
-func loadChecks(f *flags, log *slog.Logger, startup bool) (checks, error) {
+//
+// Scenarios come from their own files whichever source the checks came from,
+// and a broken one fails the load like a broken check would.
+func loadChecks(f *flags, scenarios []string, log *slog.Logger, startup bool) (checks, error) {
+	ck, err := loadProbes(f, log, startup)
+	if err != nil || len(scenarios) == 0 {
+		return ck, err
+	}
+	if ck.scenarios, err = config.Fingerprint(scenarios...); err != nil {
+		return checks{}, err
+	}
+	if ck.probes.Scenarios, err = config.LoadScenarios(scenarios...); err != nil {
+		return checks{}, err
+	}
+	return ck, nil
+}
+
+func loadProbes(f *flags, log *slog.Logger, startup bool) (checks, error) {
 	var stateErr error
 	if f.state != "" {
 		data, err := os.ReadFile(f.state)
@@ -233,7 +257,7 @@ func cmdRun(args []string) error {
 	}
 	defer a.Close()
 	a.SetConfigMeta(ck.meta)
-	reload := reloader(f, a, log)
+	reload := reloader(f, srvCfg.Scenarios.Paths, a, log)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -246,7 +270,10 @@ func cmdRun(args []string) error {
 		if ck.meta.Source == app.SourceFile {
 			loaded = ck.meta.Hash
 		}
-		go watchFiles(ctx, f.probes, loaded, every, reload, log)
+		go watchFiles(ctx, "check", f.probes, loaded, every, reload, log)
+	}
+	if every := srvCfg.Probing.WatchConfig.D(); every > 0 && len(srvCfg.Scenarios.Paths) > 0 {
+		go watchFiles(ctx, "scenario", srvCfg.Scenarios.Paths, ck.scenarios, every, reload, log)
 	}
 
 	files := server.Files{Reload: reload, Persist: persister(f)}
@@ -269,6 +296,7 @@ func cmdRun(args []string) error {
 
 	log.Info("argus started",
 		"probes", len(a.Runners()),
+		"scenarios", len(ck.probes.Scenarios),
 		"config_source", ck.meta.Source,
 		"targets", countTargets(a),
 		"listen", srvCfg.HTTP.Listen,
@@ -286,9 +314,9 @@ func cmdRun(args []string) error {
 
 // reloader re-reads the sources the node started from, state file included, so
 // SIGHUP, the file watcher and the API reload alike.
-func reloader(f *flags, a *app.App, log *slog.Logger) func() error {
+func reloader(f *flags, scenarios []string, a *app.App, log *slog.Logger) func() error {
 	return func() error {
-		next, err := loadChecks(f, log, false)
+		next, err := loadChecks(f, scenarios, log, false)
 		if err != nil {
 			return err
 		}
@@ -331,14 +359,15 @@ func countTargets(a *app.App) int {
 	return n
 }
 
-// watchFiles reloads when the check files change on disk. Off unless asked for.
-// applied is the fingerprint of the files the running configuration was read
-// from; empty when it was not read from them, and then they are taken as found.
-func watchFiles(ctx context.Context, paths []string, applied string, every time.Duration, reload func() error, log *slog.Logger) {
+// watchFiles reloads when the files of one kind change on disk. Off unless
+// asked for. applied is the fingerprint of the files the running configuration
+// was read from; empty when it was not read from them, and then they are taken
+// as found.
+func watchFiles(ctx context.Context, kind string, paths []string, applied string, every time.Duration, reload func() error, log *slog.Logger) {
 	if applied == "" {
 		var err error
 		if applied, err = config.Fingerprint(paths...); err != nil {
-			log.Error("cannot watch the check files", "err", err)
+			log.Error("cannot watch the "+kind+" files", "err", err)
 			return
 		}
 	}
@@ -354,7 +383,7 @@ func watchFiles(ctx context.Context, paths []string, applied string, every time.
 			now, err := config.Fingerprint(paths...)
 			if err != nil {
 				// A file being written is not a file that changed.
-				log.Warn("cannot read the check files", "err", err)
+				log.Warn("cannot read the "+kind+" files", "err", err)
 				continue
 			}
 			// A change has to hold still for one tick before it counts, so a
@@ -368,7 +397,7 @@ func watchFiles(ctx context.Context, paths []string, applied string, every time.
 			}
 			// Recorded before the reload: a rejected configuration is not retried.
 			applied = now
-			log.Info("check files changed, reloading")
+			log.Info(kind + " files changed, reloading")
 			if err := reload(); err != nil {
 				log.Error("reload failed, keeping the running configuration", "err", err)
 			}
@@ -490,7 +519,16 @@ func cmdOneshot(args []string) error {
 	}
 	defer a.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// A scenario takes minutes, and its interval is what it is allowed,
+	// cleanup included. Only one that is named runs: all of them is no
+	// scenario at all.
+	limit := 2 * time.Minute
+	for _, r := range a.Runners() {
+		if r.Name == f.probe && r.Kind == config.ScenarioType {
+			limit = max(limit, r.Interval+time.Minute)
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
 	defer cancel()
 	if err := a.RunOnce(ctx, f.probe); err != nil {
 		return err

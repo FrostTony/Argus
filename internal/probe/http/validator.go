@@ -43,6 +43,12 @@ type Validator struct {
 	jsonRe    *regexp.Regexp
 }
 
+// DefaultValidator is what a response is held to when nothing else is asked:
+// an answer that is not an error.
+func DefaultValidator() Validator {
+	return Validator{Name: "status", StatusCode: []string{"200-399"}}
+}
+
 type codeRange struct{ lo, hi int }
 
 func (c codeRange) has(v int) bool { return v >= c.lo && v <= c.hi }
@@ -53,11 +59,14 @@ func (v *Validator) checksSomething() bool {
 		len(v.HTTPVersion) > 0 || v.RequireTLS || v.ForbidTLS || v.CertMinDays > 0
 }
 
-func (v *Validator) readsBody() bool {
+// ReadsBody reports whether the validator needs the response body kept.
+func (v *Validator) ReadsBody() bool {
 	return v.BodyRegex != "" || v.BodyNotRegex != "" || v.JSONPath != ""
 }
 
-func (v *Validator) compile() error {
+// Compile checks the validator and prepares its patterns; call it once, before
+// the first Check.
+func (v *Validator) Compile() error {
 	if v.Name == "" {
 		v.Name = "validator"
 	}
@@ -128,7 +137,7 @@ func (p *Prober) validate(rec *metrics.Recorder, resp *http.Response, body strin
 	var firstErr error
 	for i := range p.validators {
 		v := &p.validators[i]
-		err := v.check(resp, body, size, now)
+		err := v.Check(resp, body, size, now)
 		rec.Gauge("http_validator", metrics.Bool(err == nil), "validator", v.Name)
 		v.expectInfo(rec, resp, body)
 		if err != nil && firstErr == nil {
@@ -149,7 +158,9 @@ func (v *Validator) expectInfo(rec *metrics.Recorder, resp *http.Response, body 
 	}
 }
 
-func (v *Validator) check(resp *http.Response, body string, size int64, now time.Time) error {
+// Check applies every field that is set to one response; body is what was kept
+// of it and size is how much was read.
+func (v *Validator) Check(resp *http.Response, body string, size int64, now time.Time) error {
 	if len(v.codes) > 0 && !matchCode(v.codes, resp.StatusCode) {
 		return probe.Fail(probe.ReasonStatus, "%s: got %d, want %s", v.Name, resp.StatusCode, strings.Join(v.StatusCode, ","))
 	}
@@ -201,11 +212,10 @@ func (v *Validator) checkJSON(body string) error {
 	if err := json.Unmarshal([]byte(body), &doc); err != nil {
 		return probe.Fail(probe.ReasonContent, "%s: the body is not JSON: %v", v.Name, err)
 	}
-	found, ok := jsonLookup(doc, strings.Split(v.JSONPath, "."))
+	got, ok := JSONField(doc, v.JSONPath)
 	if !ok {
 		return probe.Fail(probe.ReasonContent, "%s: %s is missing from the body", v.Name, v.JSONPath)
 	}
-	got := jsonString(found)
 	if v.JSONEquals != "" && got != v.JSONEquals {
 		return probe.Fail(probe.ReasonContent, "%s: %s = %q, want %q", v.Name, v.JSONPath, got, v.JSONEquals)
 	}
@@ -213,6 +223,16 @@ func (v *Validator) checkJSON(body string) error {
 		return probe.FailRegex("%s: %s = %q does not match %q", v.Name, v.JSONPath, got, v.JSONRegex)
 	}
 	return nil
+}
+
+// JSONField reads one field of a decoded JSON document as text: path is dotted,
+// and a numeric element indexes an array.
+func JSONField(doc any, path string) (string, bool) {
+	found, ok := jsonLookup(doc, strings.Split(path, "."))
+	if !ok {
+		return "", false
+	}
+	return jsonString(found), true
 }
 
 // jsonLookup follows a dotted path, where a numeric element indexes an array.

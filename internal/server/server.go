@@ -80,6 +80,9 @@ func New(a *app.App, files Files) (*http.Server, error) {
 		mux.Handle("/api/reload", api.write(api.reloadHandler))
 		mux.Handle("/api/probes", api.write(api.probes))
 		mux.Handle("/api/check", http.HandlerFunc(api.check))
+		mux.Handle("/api/scenarios", api.read(api.scenarios))
+		mux.Handle("/api/scenarios/{name}", api.read(api.scenario))
+		mux.Handle("/api/scenarios/{name}/run", api.write(api.runScenario))
 		if cfg.ProbeEndpoint {
 			mux.Handle("/probe", http.HandlerFunc(api.probeExposition))
 		}
@@ -275,6 +278,21 @@ func (s *api) probeExposition(w http.ResponseWriter, r *http.Request) {
 	_ = bw.Flush()
 }
 
+// read wraps a GET-only handler behind the read tokens.
+func (s *api) read(h http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, errorBody{"use GET"})
+			return
+		}
+		if !s.authorized(r, s.cfg.ReadTokens()) {
+			writeJSON(w, http.StatusUnauthorized, errorBody{"unauthorized"})
+			return
+		}
+		h(w, r)
+	})
+}
+
 // write wraps a handler behind the write tokens.
 func (s *api) write(h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -335,6 +353,9 @@ func (s *api) config(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, errorBody{err.Error()})
 			return
 		}
+		// The document carries the checks; the scenarios are the node's own
+		// files and stay as they are.
+		probes.Scenarios = s.app.Probes().Scenarios
 		// A change that cannot be written is refused, so nothing drifts.
 		if s.files.Persist == nil {
 			writeJSON(w, http.StatusConflict, errorBody{
@@ -389,6 +410,10 @@ func (s *api) probes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := r.URL.Query().Get("name")
+	if name != "" && s.app.IsScenario(name) {
+		writeJSON(w, http.StatusBadRequest, errorBody{app.ScenarioOnDemand(name).Error()})
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.checkTimeout(r))
 	defer cancel()
 	if err := s.app.RunOnce(ctx, name); err != nil {
@@ -401,6 +426,46 @@ func (s *api) probes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"ran": cmp.Or(name, "all")})
+}
+
+// scenarios lists the scenarios this node runs and how their last runs went.
+func (s *api) scenarios(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, s.app.Scenarios())
+}
+
+// scenario describes one scenario, step by step for its last run.
+func (s *api) scenario(w http.ResponseWriter, r *http.Request) {
+	st, err := s.app.Scenario(r.PathValue("name"))
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, errorBody{err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, st)
+}
+
+// runScenario starts a scenario off its schedule and answers before it ends:
+// a run takes minutes. Its outcome is read from GET /api/scenarios/{name}.
+func (s *api) runScenario(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody{"use POST"})
+		return
+	}
+	name := r.PathValue("name")
+	err := s.app.RunScenario(name)
+	switch {
+	case errors.Is(err, app.ErrNotFound):
+		writeJSON(w, http.StatusNotFound, errorBody{err.Error()})
+		return
+	case errors.Is(err, app.ErrBusy):
+		writeJSON(w, http.StatusConflict, errorBody{err.Error()})
+		return
+	case err != nil:
+		writeJSON(w, http.StatusServiceUnavailable, errorBody{err.Error()})
+		return
+	}
+	// A run changes things on the target: who asked for it belongs in the log.
+	s.app.Log.Info("scenario started via api", "scenario", name, "from", clientOf(r))
+	writeJSON(w, http.StatusAccepted, map[string]string{"started": name, "status": "/api/scenarios/" + name})
 }
 
 type errorBody struct {

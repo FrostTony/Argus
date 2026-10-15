@@ -18,6 +18,7 @@ type Server struct {
 	Probing   Probing    `yaml:"probing"`
 	Surfacers []Surfacer `yaml:"surfacers"`
 	Logging   Logging    `yaml:"logging"`
+	Scenarios Scenarios  `yaml:"scenarios"`
 }
 
 // Node labels reach every metric prefixed with node_, so they never collide
@@ -226,7 +227,7 @@ var (
 var reservedPaths = map[string]bool{
 	"/": true, "/healthz": true, "/status": true, "/status.json": true, "/status/data": true,
 	"/api/config": true, "/api/reload": true, "/api/probes": true, "/api/check": true,
-	"/probe": true, "/logo.png": true,
+	"/probe": true, "/logo.png": true, "/api/scenarios": true,
 }
 
 // Exposition returns the settings /metrics and remote-write render with.

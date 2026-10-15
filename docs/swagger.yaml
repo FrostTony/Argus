@@ -42,6 +42,11 @@ tags:
     description: The check configuration. Read and write are separate rights.
   - name: checks
     description: Running a check now, rather than at its interval.
+  - name: scenarios
+    description: |
+      Multi-step checks that act on a service the way a user does, read from
+      the files under `scenarios.paths`. Each changes the target and runs for
+      minutes, so none runs inside a request.
 
 paths:
   /metrics:
@@ -51,7 +56,7 @@ paths:
       description: |
         Every series the node currently holds, in the text exposition format.
         The path is `http.metrics_path` and can be moved. The paths the node
-        already serves — the status pages, `/healthz` and the four under `/api` —
+        already serves — the status pages, `/healthz` and those under `/api` —
         are refused as a value for it, because registering a handler twice is a
         crash at startup for what is only a typo.
 
@@ -425,6 +430,10 @@ paths:
         interval, and records the result like any other run. This is how a deploy
         verifies a new check.
 
+        Every probe means every probe and no scenario: a scenario changes the
+        target and runs for longer than a request lasts. Naming one is a 400
+        pointing at `POST /api/scenarios/{name}/run`.
+
         Unlike `/api/check`, this one writes to the store: it is a real run,
         brought forward.
       security: [{writeToken: []}]
@@ -446,6 +455,11 @@ paths:
                   ran: {type: string, description: The probe that ran, or "all".}
                 required: [ran]
               example: {ran: web}
+        "400":
+          description: The name is a scenario's.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
         "401": {$ref: "#/components/responses/Unauthorized"}
         "404":
           description: No probe of that name is configured on this node.
@@ -554,6 +568,96 @@ paths:
               schema: {$ref: "#/components/schemas/CheckResult"}
         "400": {$ref: "#/components/responses/BadRequest"}
         "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /api/scenarios:
+    get:
+      tags: [scenarios]
+      summary: The scenarios this node runs
+      description: |
+        Every scenario that runs on this node — a disabled one, or one whose
+        `run_on` names other nodes, is not here — with its steps and how its
+        last run against each target went.
+      security: [{readToken: []}]
+      responses:
+        "200":
+          description: The scenarios, in configuration order.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/Scenario"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "405": {$ref: "#/components/responses/MethodNotAllowed"}
+
+  /api/scenarios/{name}:
+    get:
+      tags: [scenarios]
+      summary: One scenario, step by step
+      description: |
+        A scenario fails at a step, and which step is the first question. The
+        last run against each target lists every step — the ones a failure kept
+        from running as `not_run` — with its status code, attempts, duration and
+        error. Secrets appear as their reference; extracted values not at all.
+      security: [{readToken: []}]
+      parameters:
+        - {name: name, in: path, required: true, schema: {type: string}, example: video-pipeline}
+      responses:
+        "200":
+          description: The scenario.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Scenario"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404":
+          description: No scenario of that name runs on this node.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "405": {$ref: "#/components/responses/MethodNotAllowed"}
+
+  /api/scenarios/{name}/run:
+    post:
+      tags: [scenarios]
+      summary: Start a scenario now
+      description: |
+        Starts a run off the schedule and answers at once: a run takes minutes,
+        longer than a request may last. The outcome goes where a scheduled run's
+        does — the metrics, and `GET /api/scenarios/{name}` once `running` is
+        false again. A write, logged with the caller: the run changes the target.
+      security: [{writeToken: []}]
+      parameters:
+        - {name: name, in: path, required: true, schema: {type: string}, example: video-pipeline}
+      responses:
+        "202":
+          description: The run has started.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  started: {type: string}
+                  status: {type: string, description: Where to read the outcome.}
+                required: [started, status]
+              example: {started: video-pipeline, status: /api/scenarios/video-pipeline}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404":
+          description: No scenario of that name runs on this node.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "405": {$ref: "#/components/responses/MethodNotAllowed"}
+        "409":
+          description: |
+            A run is in progress — scheduled, started here, or the last run of a
+            scenario a reload replaced, still cleaning up.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "503":
+          description: The node is starting or shutting down.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
 
 components:
   securitySchemes:
@@ -845,3 +949,58 @@ components:
           additionalProperties: true
           description: What the probe measured, returned inline instead of being stored.
       required: [success]
+
+    Scenario:
+      type: object
+      properties:
+        name: {type: string, example: video-pipeline}
+        interval: {type: string, example: 15m0s}
+        timeout: {type: string, example: 8m0s}
+        targets:
+          type: array
+          items: {type: string}
+        running: {type: boolean, description: Whether a run is in progress now.}
+        steps:
+          type: array
+          items: {type: string}
+          example: [login, list, upload, convert, playback, comment]
+        cleanup:
+          type: array
+          items: {type: string}
+        last_runs:
+          type: array
+          items: {$ref: "#/components/schemas/ScenarioRun"}
+      required: [name, interval, timeout, targets, running, steps, last_runs]
+
+    ScenarioRun:
+      type: object
+      description: The last run against one target.
+      properties:
+        target: {type: string}
+        started: {type: string, format: date-time}
+        duration_seconds: {type: number}
+        success: {type: boolean, description: Whether every step passed. Cleanup does not count.}
+        error: {type: string, example: "step convert: abort_if held: {\"status\": \"failed\"}"}
+        steps:
+          type: array
+          items: {$ref: "#/components/schemas/ScenarioStep"}
+        cleanup:
+          type: array
+          items: {$ref: "#/components/schemas/ScenarioStep"}
+      required: [target, started, duration_seconds, success, steps]
+
+    ScenarioStep:
+      type: object
+      properties:
+        name: {type: string}
+        status:
+          type: string
+          enum: [passed, failed, skipped, not_run]
+          description: |
+            `skipped` is a cleanup step that needed a variable no step got as
+            far as setting; `not_run` is a step a failure kept from running.
+        http_status: {type: integer}
+        attempts: {type: integer, description: Requests a waiting step made.}
+        duration_seconds: {type: number}
+        error: {type: string}
+      required: [name, status, duration_seconds]

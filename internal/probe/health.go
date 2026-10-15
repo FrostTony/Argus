@@ -10,6 +10,12 @@ import (
 // health remembers the last outcome per backend so the runner logs transitions
 // rather than results, and keeps the message behind a current failure.
 type health struct {
+	// slot is held for the length of a run, by one run at a time. It lives
+	// here rather than on the runner so a reload hands it on with the rest: a
+	// run of the probe a reload replaced, still finishing, keeps its successor
+	// from starting another against the same target until it is done.
+	slot chan struct{}
+
 	mu    sync.Mutex
 	units map[unitKey]*unitState
 	// orphans are scopes a unit wrote under before its labels changed.
@@ -33,7 +39,9 @@ type unitState struct {
 	scope metrics.Labels
 }
 
-func newHealth() *health { return &health{units: map[unitKey]*unitState{}} }
+func newHealth() *health {
+	return &health{slot: make(chan struct{}, 1), units: map[unitKey]*unitState{}}
+}
 
 func (h *health) begin() {
 	h.mu.Lock()

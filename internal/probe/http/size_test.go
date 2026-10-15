@@ -39,3 +39,21 @@ validators:
 			real, size, res.OK())
 	}
 }
+
+// And so does it for min_size_bytes, which would otherwise fail every body
+// longer than the read limit.
+func TestMinSizeReachesPastTheReadLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(bytes.Repeat([]byte("x"), 10_000))
+	}))
+	defer srv.Close()
+
+	p := newProber(t, `
+max_body_bytes: 1000
+validators:
+  - {name: big-enough, min_size_bytes: 5000}
+`)
+	if res := p.Probe(context.Background(), request(t, srv), metrics.NewRecorder(nil)); !res.OK() {
+		t.Fatalf("a 10000-byte body failed min_size_bytes: 5000: %v", res.Err)
+	}
+}

@@ -163,6 +163,12 @@ type FileBacked interface {
 	Files() []string
 }
 
+// Heir is implemented by probers that keep state of their own beyond the
+// metrics, which a reload that rebuilds the prober should not lose.
+type Heir interface {
+	Inherit(old Prober)
+}
+
 // FailureReason becomes a label on probe_failure_total.
 type FailureReason string
 

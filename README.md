@@ -118,6 +118,11 @@ limits, sinks, logging. Changes at deploy time. See
 **`probes.d/*.yaml`** — the checks. A directory is read as one configuration, so
 checks can be split per project or per team.
 
+**`scenarios.d/*.yaml`** — multi-step [scenarios](#scenarios), one per file, in
+the directories `argus.yaml` names under `scenarios.paths`. They are read from
+disk whatever the checks come from, a configuration pushed through the API
+included.
+
 Inheritance runs `defaults` → `template` → the probe itself. An unknown field is
 an error, not a silent ignore.
 
@@ -195,6 +200,122 @@ whichever is sooner, and the time spent asking is left out of
 
 [examples/probes.d/example.yaml](examples/probes.d/example.yaml) is a working
 file with every option demonstrated and commented.
+
+## Scenarios
+
+A probe asks one question. A scenario walks through a service the way a user
+does — log in, look at the list, upload a file, wait for it to be processed,
+use the result — carrying cookies and values from one step to the next, and
+removes what it left behind. A single request proves an endpoint answers; the
+queue, the workers and the storage behind it can be stopped while every
+endpoint still says 200, and only walking through shows that.
+
+Scenarios live apart from the checks, one per file, in directories named in
+`argus.yaml`:
+
+```yaml
+scenarios:
+  paths: [scenarios.d]     # relative to argus.yaml
+```
+
+```yaml
+# scenarios.d/video-pipeline.yaml — the file name names the scenario
+interval: 15m
+timeout: 8m                # the steps' budget; cleanup has its own
+run_on: ^msk-1$            # every node that runs it uploads a video
+targets: [https://admin.video.example/]
+
+secrets:
+  password: {file: /run/secrets/argus-video-admin}
+
+steps:
+  - name: login
+    http:
+      path: /api/login
+      json: {login: argus-synthetic, password: "${secret.password}"}
+    expect: [{status_code: [200]}]
+  - name: upload
+    http:
+      path: /api/videos
+      multipart:
+        fields: {title: "argus ${run.id}"}
+        files: {video: fixtures/sample.mp4}
+    expect: [{status_code: [201]}]
+    extract: {video_id: {json_path: id}}
+  - name: convert
+    http: {path: "/api/videos/${var.video_id}"}
+    until: [{json_path: status, json_equals: ready}]
+    abort_if: [{json_path: status, json_equals: failed}]
+    every: 10s
+    within: 5m
+
+cleanup:
+  - name: delete
+    http: {method: DELETE, path: "/api/videos/${var.video_id}"}
+```
+
+[examples/scenarios.d/video-pipeline.yaml](examples/scenarios.d/video-pipeline.yaml)
+is the whole of it, commented.
+
+**A file** takes the options that say when and where it runs, as a probe writes
+them — `interval`, `timeout` (both required), `targets`, `labels`, `run_on`,
+`schedule`, `disabled`, `source_ip` — and nothing from probes.d's `defaults`: a
+default made for one-request checks would quietly cut a minutes-long run short.
+`timeout` plus `cleanup_timeout` has to fit in `interval`.
+
+**A step** is one HTTP request, the checks its answer must pass and the values
+taken from it:
+
+| Key | What |
+|---|---|
+| `http.path` / `http.url` | a path on the target, or an address anywhere — a presigned upload URL an earlier step was handed |
+| `http.method` | `GET`, or `POST` when there is a body |
+| `http.query`, `http.headers` | values are encoded for you |
+| `http.body` / `body_file` / `json` / `form` / `multipart` | at most one; files are streamed from disk with their length announced, and named relative to the scenario's file |
+| `http.follow_redirects`, `http.max_body_bytes`, `timeout` | per step |
+| `expect` | the same validators as `http` (`status_code`, `body_regex`, `json_path`+`json_equals`, …); `200-399` when absent |
+| `extract` | `name: {json_path: a.b}`, `{header: Location}` or `{regex: "id=(\\w+)"}`; `metric: true` publishes it as `scenario_value` |
+| `until`, `every`, `within`, `abort_if` | ask again until `until` holds; `abort_if` ends the wait early |
+
+**References** are `${var.NAME}` (from `vars:` or an earlier step's `extract`),
+`${secret.NAME}` and `${run.id}`, which tells one run's leftovers from
+another's. Every reference is checked when the file is read: a typo, a variable
+used before a step sets it, or an environment variable that is not set is a
+configuration error rather than a request sent with `${...}` in it. A value put
+into a path is one segment of it, whatever it holds — `..` included — and a
+value for the query goes under `query:`, which encodes it. A `url` that is one
+reference and nothing else is taken whole.
+
+**Secrets** come from `file:` or `env:`, are read on every run so a rotation
+needs no reload, and are replaced by their reference in every error and report,
+as sent and as escaped for a URL or JSON. Headers go where the step's address
+points: a step that uploads to a presigned URL elsewhere should not carry the
+session's `Authorization`.
+
+**Cleanup** runs however the steps ended — failed, timed out, cancelled by a
+reload — under `cleanup_timeout` (30s by default), not the steps' deadline. A
+cleanup step that needs a variable no step got as far as setting is skipped,
+not failed; one that fails does not fail the scenario, and
+`scenario_cleanup_success` is the series to alert on before leftovers pile up.
+
+**A session** is one client: one cookie jar, connections kept between steps. A
+scenario does not fan out across a target's addresses — logging in on one and
+uploading on another, or uploading once per address, checks nothing a user
+does. Requests carry `User-Agent: argus-scenario/…`, so the service's own
+metrics can leave them out. A run holds one of `probing.max_concurrent`'s
+slots for as long as it lasts, waits included.
+
+**Running one.** A scenario changes the target and takes minutes, so it never
+runs inside a request: `/probe` and `/api/check` refuse it, and `POST
+/api/probes` without a name runs every probe but no scenario. `POST
+/api/scenarios/NAME/run` starts one off its schedule and answers at once; `GET
+/api/scenarios/NAME` shows how its last run against each target went, step by
+step. `argus oneshot -probe NAME` runs it from the command line.
+
+Each step's duration is a phase — `probe_phase_last_duration_seconds{phase="convert"}`
+is the conversion time — and `probe_success`, `probe_up` and
+`probe_failure_total{reason}` work as for any probe, the failure message naming
+the step.
 
 ## Targets
 
@@ -383,6 +504,16 @@ In `mode: output` the command's own metrics are emitted too, under
 `metric_prefix` (`external_` by default) with the name sanitised, so a command
 can report whatever it measures.
 
+### `scenario`
+
+| Metric | Shows | How |
+|---|---|---|
+| `scenario_step_success{step}` | which steps passed | 1 or 0 per step the run reached; a step after a failure has no series |
+| `scenario_step_status_code{step}` | the status of a step's last answer | the code as a number |
+| `scenario_step_attempts{step}` | how many times a waiting step asked | requests made before `until` held or the step gave up |
+| `scenario_value{step,name}` | a number a step read from an answer | an `extract` with `metric: true` |
+| `scenario_cleanup_success` | whether the leftovers were removed | 0 when a cleanup step that ran failed |
+
 ### The node itself
 
 Always under `argus_`, whatever the exposition prefix is: these belong to the
@@ -423,6 +554,9 @@ disappears stop being written and are retired after `stale_after`.
 | `POST /api/probes` | write | run a probe now, off its schedule (`?name=` for one) |
 | `GET\|POST /api/check` | read / write | run a check once and return the result as JSON |
 | `GET /probe?probe=X&target=Y` | read / write | run a check once and return it as a Prometheus exposition |
+| `GET /api/scenarios` | read | the scenarios this node runs, and each one's last run per target, step by step |
+| `GET /api/scenarios/{name}` | read | one of them |
+| `POST /api/scenarios/{name}/run` | write | start a scenario now, in the background: 202, or 409 while one is running |
 
 `/probe` also takes `module=` as a synonym for `probe=` (blackbox's name for the
 same thing), `hostname=` to change the Host header and SNI without changing the
@@ -479,7 +613,9 @@ SIGHUP re-reads the check configuration and applies it in place: probes that did
 not change keep running and keep their history, new ones start, removed ones
 stop and their series are retired. Nothing restarts, and no measurement is lost
 in the swap. `probing.watch_config` additionally polls the files and reloads
-when their content changes.
+when their content changes. Scenarios are reloaded with the checks; a scenario
+run in progress when its file changes is cancelled, its cleanup still runs,
+and the edited scenario starts its next run only once that one has finished.
 
 A change made through `PUT /api/config` is written back to the file it came
 from — atomically, keeping its permissions, following a symlink to the real
