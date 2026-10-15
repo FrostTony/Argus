@@ -145,6 +145,10 @@ type Extract struct {
 	Regex string `yaml:"regex"`
 	// Metric publishes the value as scenario_value, which then has to be a number.
 	Metric bool `yaml:"metric"`
+	// Secret masks the value in every report and message, as secrets: are —
+	// a session token the login handed out is one — and keeps a step that
+	// sends it on the target.
+	Secret bool `yaml:"secret"`
 }
 
 // anchor takes the files a scenario names relative to its own file: fixtures
@@ -244,6 +248,9 @@ type request struct {
 	files    []filePart
 	follow   bool
 	maxBody  int64
+	// sensitive is set when the request sends a secret, or a var extracted
+	// as one, anywhere but in its address.
+	sensitive bool
 }
 
 type pair struct {
@@ -259,6 +266,7 @@ type extractor struct {
 	header   string
 	regex    *regexp.Regexp
 	metric   bool
+	secret   bool
 }
 
 func compile(cfg Config) (*compiled, error) {
@@ -274,7 +282,7 @@ func compile(cfg Config) (*compiled, error) {
 		return nil, fmt.Errorf("steps: a scenario needs at least one")
 	}
 
-	defs := definitions{vars: map[string]bool{}, secrets: map[string]bool{}}
+	defs := definitions{vars: map[string]bool{}, secrets: map[string]bool{}, hidden: map[string]bool{}}
 	for _, name := range slices.Sorted(maps.Keys(cfg.Vars)) {
 		if !identifier.MatchString(name) {
 			return nil, fmt.Errorf("vars: %q is not a name", name)
@@ -312,6 +320,7 @@ func compile(cfg Config) (*compiled, error) {
 		// Set by this step, so usable from the next one on.
 		for _, x := range st.extract {
 			defs.vars[x.name] = true
+			defs.hidden[x.name] = x.secret
 		}
 		c.steps = append(c.steps, st)
 	}
@@ -328,6 +337,7 @@ func compile(cfg Config) (*compiled, error) {
 		names[st.name] = true
 		for _, x := range st.extract {
 			defs.vars[x.name] = true
+			defs.hidden[x.name] = x.secret
 		}
 		c.cleanup = append(c.cleanup, st)
 	}
@@ -420,9 +430,12 @@ func validators(field string, in []httpprobe.Validator) ([]httpprobe.Validator, 
 }
 
 func compileExtract(name string, e Extract) (extractor, error) {
-	x := extractor{name: name, jsonPath: e.JSONPath, header: e.Header, metric: e.Metric}
+	x := extractor{name: name, jsonPath: e.JSONPath, header: e.Header, metric: e.Metric, secret: e.Secret}
 	if !identifier.MatchString(name) {
 		return x, fmt.Errorf("%q is not a name", name)
+	}
+	if e.Metric && e.Secret {
+		return x, fmt.Errorf("a secret is not published as a metric: set metric or secret")
 	}
 	set := 0
 	for _, on := range []bool{e.JSONPath != "", e.Header != "", e.Regex != ""} {
@@ -531,7 +544,35 @@ func compileRequest(r Step, defs definitions) (request, error) {
 			out.files = append(out.files, filePart{field, path, contentType(path)})
 		}
 	}
+	out.sensitive = out.sends(defs)
 	return out, nil
+}
+
+// sends reports whether what the request carries besides its address — query,
+// headers, body — holds a secret.
+func (r request) sends(defs definitions) bool {
+	ts := []*template{r.body}
+	for _, p := range slices.Concat(r.query, r.headers, r.form, r.fields) {
+		ts = append(ts, &p.value)
+	}
+	ts = appendTemplates(ts, r.json)
+	return slices.ContainsFunc(ts, defs.sensitive)
+}
+
+func appendTemplates(ts []*template, v any) []*template {
+	switch t := v.(type) {
+	case *template:
+		return append(ts, t)
+	case map[string]any:
+		for _, item := range t {
+			ts = appendTemplates(ts, item)
+		}
+	case []any:
+		for _, item := range t {
+			ts = appendTemplates(ts, item)
+		}
+	}
+	return ts
 }
 
 func checkedTemplate(field, s string, defs definitions) (*template, error) {
@@ -584,6 +625,10 @@ func compileJSON(v any, defs definitions) (any, error) {
 		return out, nil
 	case map[any]any:
 		return nil, fmt.Errorf("object keys must be strings")
+	case time.Time, []byte:
+		// YAML reads 2026-01-01 as a time and !!binary as bytes; JSON would
+		// send another text than the one written.
+		return nil, fmt.Errorf("value: %v is not sent as written; quote it", t)
 	}
 	return v, nil
 }

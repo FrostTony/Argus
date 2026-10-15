@@ -13,6 +13,8 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"fmt"
+	"io"
+	"math"
 	"net"
 	"net/http"
 	"regexp"
@@ -129,13 +131,20 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 		conn = tconn
 	}
 
-	r := bufio.NewReader(conn)
+	// http.ReadResponse puts no bound on the headers it reads: net/http's
+	// limit belongs to its client, and this handshake is written by hand.
+	lr := &io.LimitedReader{R: conn, N: maxHandshake}
+	r := bufio.NewReader(lr)
 	if res.Err = p.handshake(conn, r, target, rec, &res); res.Err != nil {
 		return res
 	}
+	lr.N = math.MaxInt64 // frames carry limits of their own
 	res.Err = p.exchange(conn, r, rec, &res)
 	return res
 }
+
+// maxHandshake bounds the server's handshake answer: status line and headers.
+const maxHandshake = 64 << 10
 
 // endpoint is where to dial and what to ask for.
 type endpoint struct {

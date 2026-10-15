@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/url"
 	"slices"
 	"strconv"
 	"strings"
@@ -138,7 +139,7 @@ func (rw *RemoteWrite) ship(samples []metrics.Sample, ts int64, encode func([]me
 		end := min(start+rw.opts.MaxBatchSize, len(samples))
 		if err := rw.sendWithRetries(encode(samples[start:end], rw.opts.Prefix, ts)); err != nil {
 			rw.failures.Add(1)
-			rw.opts.Log.Warn("remote-write failed", "url", rw.opts.URL, "err", err)
+			rw.opts.Log.Warn("remote-write failed", "url", redacted(rw.opts.URL), "err", err)
 			return err
 		}
 		rw.sent.Add(int64(end - start))
@@ -424,4 +425,12 @@ func varintLen(v uint64) int {
 		n++
 	}
 	return n
+}
+
+// redacted is a URL fit for a log line: its password masked.
+func redacted(raw string) string {
+	if u, err := url.Parse(raw); err == nil {
+		return u.Redacted()
+	}
+	return "<unparsable URL>"
 }

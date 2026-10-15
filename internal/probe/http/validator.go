@@ -1,8 +1,11 @@
 package http
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"slices"
@@ -133,11 +136,11 @@ func parseCodeRange(s string) (codeRange, error) {
 }
 
 // validate runs every validator, recording all and returning the first failure.
-func (p *Prober) validate(rec *metrics.Recorder, resp *http.Response, body string, size int64, now time.Time) error {
+func (p *Prober) validate(rec *metrics.Recorder, resp *http.Response, body []byte, size int64, now time.Time) error {
 	var firstErr error
 	for i := range p.validators {
 		v := &p.validators[i]
-		err := v.Check(resp, body, size, now)
+		err := check(v, resp, body, size, now)
 		rec.Gauge("http_validator", metrics.Bool(err == nil), "validator", v.Name)
 		v.expectInfo(rec, resp, body)
 		if err != nil && firstErr == nil {
@@ -149,9 +152,13 @@ func (p *Prober) validate(rec *metrics.Recorder, resp *http.Response, body strin
 
 // expectInfo publishes the named capture groups of whatever matched, so that a
 // version string or a build id read out of the answer becomes a label.
-func (v *Validator) expectInfo(rec *metrics.Recorder, resp *http.Response, body string) {
+func (v *Validator) expectInfo(rec *metrics.Recorder, resp *http.Response, body []byte) {
 	if probe.Named(v.bodyRe) {
-		probe.ExpectInfo(rec, v.bodyRe, v.bodyRe.FindStringSubmatch(body), "validator", v.Name)
+		var match []string
+		for _, m := range v.bodyRe.FindSubmatch(body) {
+			match = append(match, string(m))
+		}
+		probe.ExpectInfo(rec, v.bodyRe, match, "validator", v.Name)
 	}
 	if probe.Named(v.headerRe) {
 		probe.ExpectInfo(rec, v.headerRe, v.headerRe.FindStringSubmatch(resp.Header.Get(v.Header)), "validator", v.Name)
@@ -161,13 +168,31 @@ func (v *Validator) expectInfo(rec *metrics.Recorder, resp *http.Response, body 
 // Check applies every field that is set to one response; body is what was kept
 // of it and size is how much was read.
 func (v *Validator) Check(resp *http.Response, body string, size int64, now time.Time) error {
+	return check(v, resp, body, size, now)
+}
+
+// text is a body as its reader holds it: the prober reads bytes, a scenario
+// keeps a string. Neither is converted into the other to be checked.
+type text interface{ string | []byte }
+
+func matches[B text](re *regexp.Regexp, b B) bool {
+	switch b := any(b).(type) {
+	case string:
+		return re.MatchString(b)
+	case []byte:
+		return re.Match(b)
+	}
+	panic("unreachable")
+}
+
+func check[B text](v *Validator, resp *http.Response, body B, size int64, now time.Time) error {
 	if len(v.codes) > 0 && !matchCode(v.codes, resp.StatusCode) {
 		return probe.Fail(probe.ReasonStatus, "%s: got %d, want %s", v.Name, resp.StatusCode, strings.Join(v.StatusCode, ","))
 	}
-	if v.bodyRe != nil && !v.bodyRe.MatchString(body) {
+	if v.bodyRe != nil && !matches(v.bodyRe, body) {
 		return probe.FailRegex("%s: body does not match %q", v.Name, v.BodyRegex)
 	}
-	if v.bodyNotRe != nil && v.bodyNotRe.MatchString(body) {
+	if v.bodyNotRe != nil && matches(v.bodyNotRe, body) {
 		return probe.FailRegex("%s: body matches forbidden %q", v.Name, v.BodyNotRegex)
 	}
 	if v.headerRe != nil && !v.headerRe.MatchString(resp.Header.Get(v.Header)) {
@@ -184,7 +209,7 @@ func (v *Validator) Check(resp *http.Response, body string, size int64, now time
 		return probe.Fail(probe.ReasonTLS, "%s: the answer came over TLS", v.Name)
 	}
 	if v.JSONPath != "" {
-		if err := v.checkJSON(body); err != nil {
+		if err := v.checkJSON([]byte(body)); err != nil {
 			return err
 		}
 	}
@@ -207,9 +232,9 @@ func (v *Validator) Check(resp *http.Response, body string, size int64, now time
 	return nil
 }
 
-func (v *Validator) checkJSON(body string) error {
-	var doc any
-	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+func (v *Validator) checkJSON(body []byte) error {
+	doc, err := DecodeJSON(body)
+	if err != nil {
 		return probe.Fail(probe.ReasonContent, "%s: the body is not JSON: %v", v.Name, err)
 	}
 	got, ok := JSONField(doc, v.JSONPath)
@@ -217,12 +242,27 @@ func (v *Validator) checkJSON(body string) error {
 		return probe.Fail(probe.ReasonContent, "%s: %s is missing from the body", v.Name, v.JSONPath)
 	}
 	if v.JSONEquals != "" && got != v.JSONEquals {
-		return probe.Fail(probe.ReasonContent, "%s: %s = %q, want %q", v.Name, v.JSONPath, got, v.JSONEquals)
+		return probe.Fail(probe.ReasonContent, "%s: %s = %q, want %q", v.Name, v.JSONPath, probe.Excerpt(got), v.JSONEquals)
 	}
 	if v.jsonRe != nil && !v.jsonRe.MatchString(got) {
-		return probe.FailRegex("%s: %s = %q does not match %q", v.Name, v.JSONPath, got, v.JSONRegex)
+		return probe.FailRegex("%s: %s = %q does not match %q", v.Name, v.JSONPath, probe.Excerpt(got), v.JSONRegex)
 	}
 	return nil
+}
+
+// DecodeJSON reads one JSON document, keeping numbers as written: an id past
+// 2^53 is not a float, and rounding it names another object.
+func DecodeJSON(body []byte) (any, error) {
+	d := json.NewDecoder(bytes.NewReader(body))
+	d.UseNumber()
+	var doc any
+	if err := d.Decode(&doc); err != nil {
+		return nil, err
+	}
+	if _, err := d.Token(); err != io.EOF {
+		return nil, errors.New("invalid character after the top-level value")
+	}
+	return doc, nil
 }
 
 // JSONField reads one field of a decoded JSON document as text: path is dotted,
@@ -264,6 +304,13 @@ func jsonString(v any) string {
 	switch t := v.(type) {
 	case string:
 		return t
+	case json.Number:
+		// An integer as written; anything else as the float it reads as.
+		if !strings.ContainsAny(t.String(), ".eE") {
+			return t.String()
+		}
+		f, _ := t.Float64()
+		return strconv.FormatFloat(f, 'f', -1, 64)
 	case float64:
 		return strconv.FormatFloat(t, 'f', -1, 64)
 	case bool:

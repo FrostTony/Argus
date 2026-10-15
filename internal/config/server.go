@@ -53,11 +53,20 @@ type API struct {
 	// ReadAuth and WriteAuth are "token" or "none".
 	ReadAuth  string `yaml:"read_auth"`
 	WriteAuth string `yaml:"write_auth"`
+	// Capture decides what /api/check?capture=true may read: off, public
+	// addresses only, or all. Public by default — a capture that reaches
+	// loopback or link-local hands out the node's own network, cloud
+	// metadata credentials included.
+	Capture string `yaml:"capture"`
 }
 
 const (
 	AuthToken = "token"
 	AuthNone  = "none"
+
+	CaptureOff    = "off"
+	CapturePublic = "public"
+	CaptureAll    = "all"
 )
 
 // ReadTokens lists the tokens that authorise a read.
@@ -171,7 +180,10 @@ func DefaultServer() Server {
 			Listen:      ":6767",
 			MetricsPath: "/metrics",
 			Timeout:     Duration(30 * time.Second),
-			API:         API{ReadAuth: AuthToken, WriteAuth: AuthToken, ProbeEndpoint: true, ProbeAliases: true},
+			API: API{
+				ReadAuth: AuthToken, WriteAuth: AuthToken,
+				ProbeEndpoint: true, ProbeAliases: true, Capture: CapturePublic,
+			},
 		},
 		Resolver: Resolver{
 			Mode:        "system",
@@ -196,7 +208,10 @@ func DefaultServer() Server {
 	}
 }
 
-var validAuth = map[string]bool{AuthToken: true, AuthNone: true}
+var (
+	validAuth    = map[string]bool{AuthToken: true, AuthNone: true}
+	validCapture = map[string]bool{CaptureOff: true, CapturePublic: true, CaptureAll: true}
+)
 
 func (a API) validate() error {
 	if !a.Enabled {
@@ -206,6 +221,16 @@ func (a API) validate() error {
 		if !validAuth[mode] {
 			return fmt.Errorf("http.api.%s: want token|none, got %q", field, mode)
 		}
+	}
+	for field, token := range map[string]string{"token": a.Token, "read_token": a.ReadToken} {
+		// An unset variable stays as text, and that text is in the example
+		// everyone copies.
+		if ref := envRef.FindString(token); ref != "" {
+			return fmt.Errorf("http.api.%s: %s is not set in the environment", field, ref)
+		}
+	}
+	if !validCapture[a.Capture] {
+		return fmt.Errorf("http.api.capture: want off|public|all, got %q", a.Capture)
 	}
 	if a.WriteAuth == AuthToken && a.Token == "" {
 		return fmt.Errorf("http.api.write_auth=token requires http.api.token")

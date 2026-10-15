@@ -110,6 +110,12 @@ func revocation(ctx context.Context, st *tls.ConnectionState, now time.Time) (*o
 	if len(leaf.OCSPServer) == 0 {
 		return nil, 0, fmt.Errorf("the certificate names no OCSP responder")
 	}
+	// The responder's address is written in the certificate. Unverified, it
+	// is whatever the peer chose, and asking it would let any server send this
+	// node to an address of its choosing.
+	if len(st.VerifiedChains) == 0 {
+		return nil, 0, fmt.Errorf("the certificate is not verified, so the responder it names is not asked")
+	}
 
 	key := fingerprintOf(leaf.Raw)
 	if resp, err, ok := answers.get(key, now); ok {

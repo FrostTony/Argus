@@ -164,7 +164,7 @@ itself.
 
 | Type | Checks | Notable options |
 |---|---|---|
-| `http` | status, body, headers, JSON fields, redirect chain, certificate | `method`, `headers`, `body`, `auth`, `follow_redirects`, `read_body`, `http2`, `compression`, `proxy_url`, `proxy_from_environment`, `no_proxy`, `validators` |
+| `http` | status, body, headers, JSON fields, redirect chain, certificate | `method`, `headers`, `body`, `auth`, `follow_redirects`, `redirect_to_private`, `read_body`, `http2`, `compression`, `proxy_url`, `proxy_from_environment`, `no_proxy`, `validators` |
 | `dns` | answers, rcode, authority and additional sections, drift between resolvers | `servers`, `proto` (`udp`/`tcp`/`tls`/`https`), `query_type`, `min_answers`, `expect`, `valid_rcodes`, `require_authoritative`, `compare_servers` |
 | `tls` | the certificate on the connection, apart from any request | `port`, `min_days_left` |
 | `tcp` | the port, or a scripted conversation over it | `port`, `steps` (`send`/`expect`/`starttls`), `tls` |
@@ -196,7 +196,15 @@ failed — otherwise every service would depend on a third party's uptime, and a
 replayed "good" would read as one. A revocation is not undone by the answer
 being old. Responder answers are cached for an hour or until they go stale,
 whichever is sooner, and the time spent asking is left out of
-`probe_duration_seconds`: the responder is not the target.
+`probe_duration_seconds`: the responder is not the target. The responder is
+asked only when the certificate verified — its address is written in the
+certificate, and an unverified one names whatever its holder likes.
+
+A target on a public address cannot redirect an `http` check to a private one
+— loopback, link-local, the node's own network: any site under test could
+otherwise point the node inward. A target that is itself private redirects
+where it likes, and `redirect_to_private: true` lifts the rule for a public
+one. With a proxy, the proxy decides.
 
 [examples/probes.d/example.yaml](examples/probes.d/example.yaml) is a working
 file with every option demonstrated and commented.
@@ -282,7 +290,7 @@ taken from it:
 | `follow_redirects`, `max_body_bytes`, `timeout` | per step |
 | `status` | `201`, `2xx`, `"200-299"` or a list of them; `200-399` unless this or an `expect` says otherwise |
 | `expect` | the same validators as `http` (`body_regex`, `header_regex`, `json_path`+`json_equals`, size bounds, …) |
-| `extract` | `name: {json_path: a.b}`, `{header: Location}` or `{regex: "id=(\\w+)"}`; `metric: true` publishes it as `scenario_value` |
+| `extract` | `name: {json_path: a.b}`, `{header: Location}` or `{regex: "id=(\\w+)"}`; `metric: true` publishes it as `scenario_value`; `secret: true` treats it as a secret (a session token) |
 | `until`, `every`, `within`, `abort_if` | ask again until `until` holds; `abort_if` ends the wait early |
 
 **References** are `${var.NAME}` (from `vars:` or an earlier step's `extract`),
@@ -299,9 +307,18 @@ that got it, as a browser reads it.
 
 **Secrets** come from `file:` or `env:`, are read on every run so a rotation
 needs no reload, and are replaced by their reference in every error and report,
-as sent and as escaped for a URL or JSON. Headers go where the step's address
-points: a step that uploads to a presigned URL elsewhere should not carry the
-session's `Authorization`.
+in every form it takes on the way out and back — escaped for a path, a query
+or JSON, HTML-escaped, `\/`, lowercase `%xx`. Checks and extracts read the
+answer as it came; only what is shown is masked. An extracted value marked
+`secret: true` is treated the same from the step that sets it on.
+
+A secret stays on the target. A redirect to another origin (scheme, host,
+port) is followed without the step's headers, and refused if it would send the
+step's body again (307/308). An address taken whole from an answer — a
+Location, a URL in JSON — is refused for a step that sends a secret, unless it
+is on the target's origin. JSON numbers are kept as written, so an id past
+2^53 is not rounded into another object's; an unquoted date in `json:` is
+refused, as YAML would send it as a timestamp.
 
 **Cleanup** runs however the steps ended — failed, timed out, cancelled by a
 reload — under `cleanup_timeout` (30s by default), not the steps' deadline. A
@@ -578,6 +595,21 @@ scrape stays a valid exposition, and whoever is holding curl gets the log.
 send the probe's credentials somewhere the configuration did not, and the third
 returns what the target answered.
 
+`/api/check` takes the same three, and `capture=true` on top: each backend
+then returns `artifacts` — what it actually answered, base64, as served. For
+`http` that is the exchange (every redirect hop with its response headers) and
+the body up to `max_body_bytes`, which is how a failing check shows the block
+page, WAF challenge or parked domain behind it. Capture is a write as well, and
+it is for one target: every answer is held until the reply is written, so a
+probe with several targets needs `target=`. A scheduled run never captures.
+
+What a capture may read is `http.api.capture`. The default, `public`, never
+connects to loopback, link-local (cloud metadata), private, CGNAT or reserved
+addresses; the check runs on each connection after resolution, so neither a
+redirect nor a proxy nor DNS rebinding carries it inward. `all` lifts that,
+for nodes that capture internal services; `off` refuses capture. A body stops
+at `max_body_bytes` or 2 MiB, the exchange at 64 KiB.
+
 `/probe` carries no histograms. One run is not a distribution — a histogram
 scraped there has a count of one and never moves, so `rate()` over it reads as
 nothing happening. The `*_last_duration_seconds` gauge beside it is the
@@ -587,7 +619,23 @@ The `/api/*` paths exist only when `http.api.enabled` is set. Authentication is
 a bearer token, compared in constant time, with a separate read-only token if
 one is configured. Naming a target, or sending a probe definition in the body,
 makes the request a write — because both send the probe's credentials somewhere
-the configuration did not say to send them.
+the configuration did not say to send them. A token that is still a
+`${VAR}` reference — the variable was not set — is refused at start: that text
+is in the example everyone copies.
+
+`GET /api/config` gives the read token the document with its credentials
+masked — values under keys such as `password`, `token`, `secret`,
+`authorization`, and the password of any URL; the write token gets it as
+written. A target written with a password in its URL is named without it, on
+`/metrics` and the status page alike.
+
+The API is for clients, not for web pages: a request a browser marks as
+cross-site (`Origin` of another host, `Sec-Fetch-Site: cross-site`) is refused
+with 403 whatever token it carries. With `write_auth: none`, writes are taken
+only at an IP address or `localhost` — a page that rebinds its own name to the
+node arrives under that name. On-demand checks (`/probe`, `/api/check`) have a
+quarter of `probing.max_concurrent` to themselves and never take the slots
+scheduled probes run on.
 
 **A write token is equivalent to shell access on the node**: a probe definition
 of type `external` runs a command. Treat it accordingly.

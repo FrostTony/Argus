@@ -267,7 +267,7 @@ func (t *Target) parseShorthand(s string, line int) error {
 			t.Port, _ = strconv.Atoi(p)
 		}
 		if t.Name == "" {
-			t.Name = s
+			t.Name = RedactURL(s)
 		}
 		return nil
 	}

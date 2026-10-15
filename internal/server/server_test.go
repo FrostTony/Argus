@@ -30,8 +30,11 @@ func init() {
 
 type noop struct{}
 
-func (noop) Probe(context.Context, probe.Request, *metrics.Recorder) probe.Result {
-	return probe.Result{}
+func (noop) Probe(_ context.Context, req probe.Request, _ *metrics.Recorder) probe.Result {
+	if req.Capture == nil {
+		return probe.Result{}
+	}
+	return probe.Result{Artifacts: []probe.Artifact{{Name: "body", MediaType: "text/html", Data: []byte("<h1>hi</h1>")}}}
 }
 
 type broken struct{}
@@ -909,5 +912,46 @@ func TestProbeEndpointNeedsWritePermissionForAChosenHostname(t *testing.T) {
 	}
 	if code, _ := do(t, ts, http.MethodGet, "/probe?probe=one&hostname=elsewhere.test", "tok", ""); code != http.StatusOK {
 		t.Error("hostname= was refused with a write token")
+	}
+}
+
+func TestCheckCapturesWhatTheTargetAnswered(t *testing.T) {
+	a := newAppWith(t, func(c *config.Server) { c.HTTP.API.ReadToken = "ro" })
+	ts := serve(t, a, nil)
+
+	if _, plain := do(t, ts, http.MethodGet, "/api/check?probe=one", "ro", ""); strings.Contains(plain, `"artifacts"`) {
+		t.Errorf("artifacts came back without capture=true:\n%s", plain)
+	}
+	// What the target answered is more than the measurement a read token is for.
+	if code, _ := do(t, ts, http.MethodGet, "/api/check?probe=one&capture=true", "ro", ""); code != http.StatusUnauthorized {
+		t.Errorf("capture was granted to the read token: %d", code)
+	}
+
+	code, out := do(t, ts, http.MethodGet, "/api/check?probe=one&capture=true", "tok", "")
+	if code != http.StatusOK {
+		t.Fatalf("capture: %d %s", code, out)
+	}
+	var res app.CheckResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatal(err)
+	}
+	got := res.Targets[0].Backends[0].Artifacts
+	if len(got) != 1 || got[0].Name != "body" || string(got[0].Data) != "<h1>hi</h1>" {
+		t.Fatalf("artifacts = %+v", got)
+	}
+	if !strings.Contains(out, `"data":"PGgxPmhpPC9oMT4="`) {
+		t.Errorf("the body did not travel as base64:\n%s", out)
+	}
+}
+
+func TestCaptureIsForOneTarget(t *testing.T) {
+	ts := serve(t, newApp(t), nil)
+
+	spec := "name: many\ntype: noop\ntargets: [\"1.1.1.1\", \"8.8.8.8\"]\nnoop: {}\n"
+	if code, out := do(t, ts, http.MethodPost, "/api/check?capture=true", "tok", spec); code != http.StatusBadRequest {
+		t.Errorf("capture over two targets: %d %s", code, out)
+	}
+	if code, out := do(t, ts, http.MethodPost, "/api/check?capture=true&target=1.1.1.1", "tok", spec); code != http.StatusOK {
+		t.Errorf("capture narrowed to one target: %d %s", code, out)
 	}
 }

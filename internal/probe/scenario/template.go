@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"net/url"
 	"regexp"
 	"slices"
 	"strings"
+
+	"github.com/tonyamdfrost-cmd/Argus/internal/probe"
 )
 
 // A reference is ${var.NAME}, ${secret.NAME} or ${run.id}. ${NAME}, an
@@ -109,16 +112,23 @@ func (t template) render(s *scope, escape escaper) (string, error) {
 // empty value joins its neighbours. "/videos/${var.id}/files" with an id of
 // ".." would DELETE /files.
 func segment(v string) (string, error) {
-	switch v {
-	case "":
+	if v == "" {
 		return "", errors.New("an empty value cannot be a path segment")
-	case ".", "..":
-		return "", fmt.Errorf("%q cannot be a path segment", v)
 	}
-	// A colon is left alone by PathEscape, and in the first segment of a
-	// relative path it reads as a scheme: "urn:42/files" leaves the target.
-	return strings.ReplaceAll(url.PathEscape(v), ":", "%3A"), nil
+	// A server that decodes %2F before cleaning the path reads "../x" as two
+	// segments, the first of them a step up.
+	for _, part := range strings.FieldsFunc(v, func(r rune) bool { return r == '/' || r == '\\' }) {
+		if p, _, _ := strings.Cut(part, ";"); p == "." || p == ".." {
+			return "", fmt.Errorf("%q holds a dot segment and cannot be a path segment", v)
+		}
+	}
+	return escapeSegment(v), nil
 }
+
+// escapeSegment is a value as segment sends it. A colon is left alone by
+// PathEscape, and in the first segment of a relative path it reads as a
+// scheme: "urn:42/files" leaves the target.
+func escapeSegment(v string) string { return strings.ReplaceAll(url.PathEscape(v), ":", "%3A") }
 
 // inPath checks that every reference of an address sits in its path: a value
 // in the host would choose the server, and one in the query would be read as
@@ -165,17 +175,42 @@ type mask struct{ text, ref string }
 func newScope(vars, secrets map[string]string) *scope {
 	s := &scope{vars: vars, secrets: secrets, runID: newRunID()}
 	for name, v := range secrets {
-		ref := ref{nsSecret, name}.String()
-		quoted, _ := json.Marshal(v)
-		for _, form := range []string{v, url.QueryEscape(v), url.PathEscape(v), string(quoted[1 : len(quoted)-1])} {
-			s.masks = append(s.masks, mask{form, ref})
-		}
+		s.hide(v, ref{nsSecret, name}.String())
+	}
+	return s
+}
+
+// hide masks a value in every message from now on, in each form it may take
+// on the way out and back: as sent in a path, a query or a JSON string, and as
+// a server may echo it — HTML-escaped, with \/ or lowercase %xx.
+func (s *scope) hide(v, ref string) {
+	if strings.TrimSpace(v) == "" {
+		return
+	}
+	for _, form := range forms(v) {
+		s.masks = append(s.masks, mask{form, ref})
 	}
 	// Longest first: a secret that contains another must not be left with
 	// the other masked and the rest of it in the clear.
-	slices.SortFunc(s.masks, func(a, b mask) int { return cmp.Compare(len(b.text), len(a.text)) })
-	return s
+	slices.SortStableFunc(s.masks, func(a, b mask) int { return cmp.Compare(len(b.text), len(a.text)) })
 }
+
+var hexEscape = regexp.MustCompile(`%[0-9A-F]{2}`)
+
+func forms(v string) []string {
+	quoted, _ := json.Marshal(v)
+	inJSON := string(quoted[1 : len(quoted)-1])
+	out := []string{v, inJSON, strings.ReplaceAll(inJSON, "/", `\/`), html.EscapeString(v)}
+	for _, e := range []string{url.QueryEscape(v), url.PathEscape(v), escapeSegment(v)} {
+		out = append(out, e, hexEscape.ReplaceAllStringFunc(e, strings.ToLower))
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
+}
+
+// excerpt quotes a body in a message, masked before it is cut: a cut through
+// a secret would leave a part no mask matches.
+func (s *scope) excerpt(body string) string { return probe.Excerpt(s.redact(body)) }
 
 func (s *scope) lookup(r ref) (string, bool) {
 	switch r.ns {
@@ -209,6 +244,15 @@ func (s *scope) redact(msg string) string {
 type definitions struct {
 	vars    map[string]bool
 	secrets map[string]bool
+	// hidden are the vars extracted as secrets.
+	hidden map[string]bool
+}
+
+// sensitive reports whether a template sends a secret.
+func (d definitions) sensitive(t *template) bool {
+	return t != nil && slices.ContainsFunc(t.refs, func(r ref) bool {
+		return r.ns == nsSecret || (r.ns == nsVar && d.hidden[r.name])
+	})
 }
 
 func (d definitions) check(t template) error {

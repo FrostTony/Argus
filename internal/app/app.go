@@ -33,8 +33,12 @@ type App struct {
 	Log   *slog.Logger
 	Sink  metrics.Sink
 
-	resolver  resolve.Resolver
+	resolver resolve.Resolver
+	// sem caps the scheduled runs' backend requests; adhoc caps the
+	// on-demand ones apart, so that callers of /probe and /api/check, read
+	// tokens included, cannot take the slots monitoring runs on.
 	sem       chan struct{}
+	adhoc     chan struct{}
 	buckets   metrics.Buckets
 	closers   []func() error
 	reopeners []func() error
@@ -132,6 +136,7 @@ func Build(server config.Server, probes config.Probes, log *slog.Logger) (*App, 
 		Log:     log,
 		Store:   metrics.NewStore(server.Probing.StaleAfter.D(), server.Probing.MaxSeries),
 		sem:     make(chan struct{}, max(1, server.Probing.MaxConcurrent)),
+		adhoc:   make(chan struct{}, max(1, server.Probing.MaxConcurrent/4)),
 		buckets: metrics.Buckets(server.Probing.LatencyBuckets),
 		probes:  map[string]*running{},
 	}

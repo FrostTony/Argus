@@ -178,7 +178,7 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 	rec.Info("grpc_status_info", code)
 	if code != "0" {
 		message := cmp.Or(resp.Trailer.Get("grpc-message"), resp.Header.Get("grpc-message"))
-		res.Err = probe.Fail(probe.ReasonStatus, "grpc-status %s %s", code, message)
+		res.Err = probe.Fail(probe.ReasonStatus, "grpc-status %s %s", probe.Excerpt(code), probe.Excerpt(message))
 		return res
 	}
 

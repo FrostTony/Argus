@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
@@ -13,7 +14,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -162,6 +166,7 @@ func (s *api) check(w http.ResponseWriter, r *http.Request) {
 		Target:   r.URL.Query().Get("target"),
 		Hostname: r.URL.Query().Get("hostname"),
 		Debug:    r.URL.Query().Get("debug") == "true",
+		Capture:  r.URL.Query().Get("capture") == "true",
 	}
 
 	// A body, when present, is a probe definition of its own.
@@ -175,12 +180,9 @@ func (s *api) check(w http.ResponseWriter, r *http.Request) {
 	}
 	definition := len(bytes.TrimSpace(body)) > 0
 
-	tokens := s.cfg.ReadTokens()
-	if definition || req.Target != "" || req.Hostname != "" || req.Debug {
-		tokens = s.cfg.WriteTokens()
-	}
-	if !s.authorized(r, tokens) {
-		writeJSON(w, http.StatusUnauthorized, errorBody{"unauthorized"})
+	// Capture returns what the target answered, as the trace does: a write.
+	write := definition || req.Target != "" || req.Hostname != "" || req.Debug || req.Capture
+	if !s.admit(w, r, write) {
 		return
 	}
 	// Parsed only once authorised: parsing expands ${VAR}, and its errors quote values.
@@ -202,6 +204,10 @@ func (s *api) check(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The HTTP status describes the API call, not the check's outcome.
+	if req.Capture {
+		writeCompactJSON(w, http.StatusOK, res)
+		return
+	}
 	writeJSON(w, http.StatusOK, res)
 }
 
@@ -247,12 +253,7 @@ func (s *api) probeExposition(w http.ResponseWriter, r *http.Request) {
 	// credentials somewhere it was not configured to send them: a write. So is
 	// the trace, which carries what the target answered and what was asked of
 	// it — more than the measurement a read token is for.
-	tokens := s.cfg.ReadTokens()
-	if req.Target != "" || req.Hostname != "" || req.Debug {
-		tokens = s.cfg.WriteTokens()
-	}
-	if !s.authorized(r, tokens) {
-		writeJSON(w, http.StatusUnauthorized, errorBody{"unauthorized"})
+	if !s.admit(w, r, req.Target != "" || req.Hostname != "" || req.Debug) {
 		return
 	}
 
@@ -285,8 +286,7 @@ func (s *api) read(h http.HandlerFunc) http.Handler {
 			writeJSON(w, http.StatusMethodNotAllowed, errorBody{"use GET"})
 			return
 		}
-		if !s.authorized(r, s.cfg.ReadTokens()) {
-			writeJSON(w, http.StatusUnauthorized, errorBody{"unauthorized"})
+		if !s.admit(w, r, false) {
 			return
 		}
 		h(w, r)
@@ -296,27 +296,79 @@ func (s *api) read(h http.HandlerFunc) http.Handler {
 // write wraps a handler behind the write tokens.
 func (s *api) write(h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.authorized(r, s.cfg.WriteTokens()) {
-			writeJSON(w, http.StatusUnauthorized, errorBody{"unauthorized"})
+		if !s.admit(w, r, true) {
 			return
 		}
 		h(w, r)
 	})
 }
 
+// admit lets a request through to the API or answers it. A web page cannot
+// use the API on its operator's behalf: a cross-site request is refused
+// whatever it carries, and a write that needs no token answers only to the
+// node's address — a page that rebinds its own name to the node sends that
+// name instead.
+func (s *api) admit(w http.ResponseWriter, r *http.Request, write bool) bool {
+	tokens := s.cfg.ReadTokens()
+	if write {
+		tokens = s.cfg.WriteTokens()
+	}
+	if err := fromPage(r, write && len(tokens) == 0); err != nil {
+		writeJSON(w, http.StatusForbidden, errorBody{err.Error()})
+		return false
+	}
+	if !authorized(r, tokens) {
+		writeJSON(w, http.StatusUnauthorized, errorBody{"unauthorized"})
+		return false
+	}
+	return true
+}
+
+// fromPage reports why a request looks like a browser page's rather than a
+// client's. API clients send neither Origin nor Sec-Fetch-Site.
+func fromPage(r *http.Request, open bool) error {
+	if site := r.Header.Get("Sec-Fetch-Site"); site == "cross-site" || site == "same-site" {
+		return errors.New("cross-site requests are refused")
+	}
+	if origin := r.Header.Get("Origin"); origin != "" {
+		if u, err := url.Parse(origin); err != nil || !strings.EqualFold(u.Host, r.Host) {
+			return errors.New("cross-origin requests are refused")
+		}
+	}
+	if open && !byAddress(r.Host) {
+		return fmt.Errorf("with no write token, writes are taken only at an IP address or localhost, not %q", r.Host)
+	}
+	return nil
+}
+
+// byAddress reports whether a Host header names the node by address.
+func byAddress(host string) bool {
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	_, err := netip.ParseAddr(host)
+	return err == nil
+}
+
 // authorized checks the bearer token against the ones that grant this action;
-// an empty list needs none. Every candidate is compared in constant time.
-func (s *api) authorized(r *http.Request, tokens []string) bool {
+// an empty list needs none. Digests are compared, in constant time, so that
+// neither the content nor the length of a token shows in the timing.
+func authorized(r *http.Request, tokens []string) bool {
 	if len(tokens) == 0 {
 		return true
 	}
-	got := []byte(r.Header.Get("Authorization"))
+	got := sha256.Sum256([]byte(r.Header.Get("Authorization")))
 	ok := false
 	for _, t := range tokens {
 		if t == "" {
 			continue
 		}
-		if subtle.ConstantTimeCompare(got, []byte("Bearer "+t)) == 1 {
+		want := sha256.Sum256([]byte("Bearer " + t))
+		if subtle.ConstantTimeCompare(got[:], want[:]) == 1 {
 			ok = true
 		}
 	}
@@ -327,19 +379,20 @@ func (s *api) authorized(r *http.Request, tokens []string) bool {
 // with ${VAR} unexpanded, and replaces it on PUT. A rejected configuration
 // changes nothing.
 func (s *api) config(w http.ResponseWriter, r *http.Request) {
-	tokens := s.cfg.WriteTokens()
-	if r.Method == http.MethodGet {
-		tokens = s.cfg.ReadTokens()
-	}
-	if !s.authorized(r, tokens) {
-		writeJSON(w, http.StatusUnauthorized, errorBody{"unauthorized"})
+	if !s.admit(w, r, r.Method != http.MethodGet) {
 		return
 	}
 
 	switch r.Method {
 	case http.MethodGet:
+		doc := s.app.ConfigMeta().Document
+		// Credentials are for whoever may change them: a read token is a
+		// dashboard's, and the document is the probes' secrets as written.
+		if !authorized(r, s.cfg.WriteTokens()) {
+			doc = config.Redact(doc)
+		}
 		w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
-		_, _ = w.Write(s.app.ConfigMeta().Document)
+		_, _ = w.Write(doc)
 
 	case http.MethodPut, http.MethodPost:
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxConfigBody))
@@ -474,16 +527,25 @@ type errorBody struct {
 
 // writeJSON encodes before it answers, so a value that cannot be encoded is a
 // 500 rather than a success with an empty body.
-func writeJSON(w http.ResponseWriter, code int, v any) {
+func writeJSON(w http.ResponseWriter, code int, v any) { encodeJSON(w, code, v, "  ") }
+
+// writeCompactJSON is for answers that carry artifacts: base64 is not read by
+// eye, and indenting it is most of what writing such an answer costs.
+func writeCompactJSON(w http.ResponseWriter, code int, v any) { encodeJSON(w, code, v, "") }
+
+func encodeJSON(w http.ResponseWriter, code int, v any, indent string) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
-	enc.SetIndent("", "  ")
+	enc.SetIndent("", indent)
 	if err := enc.Encode(v); err != nil {
 		code = http.StatusInternalServerError
 		buf.Reset()
 		_ = enc.Encode(errorBody{err.Error()})
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	h := w.Header()
+	h.Set("Content-Type", "application/json; charset=utf-8")
+	// An answer may quote a target's page; it must never be sniffed into one.
+	h.Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(code)
 	_, _ = buf.WriteTo(w)
 }

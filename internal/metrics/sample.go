@@ -6,6 +6,7 @@ package metrics
 import (
 	"context"
 	"time"
+	"unicode/utf8"
 )
 
 // Sample is one measurement with its identity; the name carries no prefix.
@@ -84,9 +85,20 @@ func (r *Recorder) Gauge(name string, v float64, extra ...string) {
 	r.add(name, Gauge(v), extra)
 }
 
+// infoMax bounds an info value: it is a label, and the text is often the
+// target's — a certificate's name, a status, a URL it redirected to.
+const infoMax = 256
+
 func (r *Recorder) Info(name, text string, extra ...string) {
 	if text == "" {
 		return
+	}
+	if len(text) > infoMax {
+		n := infoMax
+		for n > 0 && !utf8.RuneStart(text[n]) {
+			n--
+		}
+		text = text[:n]
 	}
 	r.add(name, Info(text), extra)
 }

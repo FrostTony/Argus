@@ -15,6 +15,7 @@ import (
 	"net/http/httptrace"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,6 +70,10 @@ type Config struct {
 
 	// ExposeFinalURL adds the redirect destination as a label; off by default.
 	ExposeFinalURL bool `yaml:"expose_final_url"`
+	// RedirectToPrivate lets a target on a public address redirect the check
+	// to a private one — loopback, link-local, the node's own network. Off,
+	// any site under test could point this node inward.
+	RedirectToPrivate bool `yaml:"redirect_to_private"`
 }
 
 type Prober struct {
@@ -245,9 +250,12 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 	}
 	defer resp.Body.Close()
 
-	body, size, readErr := p.drain(resp)
+	body, size, readErr := p.drain(resp, p.keep(req.Capture != nil))
 	done := time.Now()
 	p.phases(&res, t, done)
+	if req.Capture != nil {
+		res.Artifacts = artifacts(resp, body, size)
+	}
 	p.recordResponse(rec, resp, size, t.wasReused())
 	var revoked error
 	if resp.TLS != nil {
@@ -283,6 +291,13 @@ func (p *Prober) client(req probe.Request, u *url.URL) (*http.Client, *probe.Con
 	b := req.Backend
 	origin := asciiHost(u.Hostname())
 	dialer := req.Dialer("tcp")
+	away := dialer
+	// A proxy reaches the destination itself, so only its address is dialled.
+	if !p.cfg.RedirectToPrivate && p.proxy == nil && dialer.Control == nil && b.Valid() && public(b.Addr) {
+		d := *dialer
+		d.Control = probe.Control(public, "a redirect from a public address does not lead to %s (redirect_to_private: true allows it)")
+		away = &d
+	}
 	conns := &probe.Conns{}
 	tlsCfg := p.tlsConfig.Clone()
 	if tlsCfg.ServerName == "" && req.Hostname != "" {
@@ -294,11 +309,12 @@ func (p *Prober) client(req probe.Request, u *url.URL) (*http.Client, *probe.Con
 		DisableCompression: !p.cfg.Compression,
 		ForceAttemptHTTP2:  p.cfg.HTTP2 == nil || *p.cfg.HTTP2,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			// Only the domain under test is pinned.
+			// Only the domain under test is pinned; everything else is where a
+			// redirect led, and is vetted as such.
 			if b.Valid() && sameHost(addr, origin) {
-				addr = pin(addr, b)
+				return conns.Dial(ctx, dialer, network, pin(addr, b))
 			}
-			return conns.Dial(ctx, dialer, network, addr)
+			return conns.Dial(ctx, away, network, addr)
 		},
 	}
 	if p.proxy != nil {
@@ -341,6 +357,10 @@ func (p *Prober) client(req probe.Request, u *url.URL) (*http.Client, *probe.Con
 	}
 	return c, conns
 }
+
+// public decides which addresses count as the internet at large; a test
+// stands loopback in for it.
+var public = probe.Public
 
 // asciiHost is the host as the transport dials it: IDNA ASCII for a Unicode name.
 func asciiHost(host string) string {
@@ -406,21 +426,74 @@ func (p *Prober) buildRequest(ctx context.Context, u *url.URL, t *timings) (*htt
 	return req, nil
 }
 
-// drain reads the body, bounded, and returns what was kept and the size read.
-func (p *Prober) drain(resp *http.Response) (string, int64, error) {
-	if !p.readBody {
+// keep is how much of the body a check holds on to: all a validator may read,
+// or as much as a capture hands back.
+func (p *Prober) keep(capture bool) int64 {
+	switch {
+	case p.keepBody:
+		return p.maxBody
+	case capture:
+		return min(p.maxBody, probe.CaptureLimit)
+	}
+	return 0
+}
+
+// drain reads the body, bounded, keeps its first keep bytes and returns them
+// with the size read.
+func (p *Prober) drain(resp *http.Response, keep int64) ([]byte, int64, error) {
+	if !p.readBody && keep == 0 {
 		n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, p.sizeLimit))
-		return "", n, nil
+		return nil, n, nil
 	}
-	var sb strings.Builder
-	var kept io.Writer = io.Discard
-	if p.keepBody {
-		kept = &sb
+	var (
+		body  []byte
+		n     int64
+		err   error
+		limit = p.maxBody
+	)
+	if keep > 0 {
+		limit = keep
+		body, err = readBody(resp.Body, keep, resp.ContentLength)
+		n = int64(len(body))
+	} else {
+		n, err = io.Copy(io.Discard, io.LimitReader(resp.Body, limit))
 	}
-	n, err := io.Copy(kept, io.LimitReader(resp.Body, p.maxBody))
-	// Read past the limit so the connection survives and max_size_bytes can fail.
-	extra, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, p.sizeLimit-n))
-	return sb.String(), n + extra, err
+	// Read past the limit so the connection survives, max_size_bytes can fail
+	// and a cut body knows it was cut.
+	extra, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, max(p.sizeLimit, limit+1)-n))
+	return body, n + extra, err
+}
+
+// trustDeclared is as much of a declared length as is allocated before the
+// bytes arrive: the length comes from the server under test, and a lie must
+// not cost more than this.
+const trustDeclared = 4 << 20
+
+// readBody reads up to limit bytes into a buffer sized for the declared
+// length, or doubling from 32 KiB without one: append grows by a quarter past
+// a few hundred kilobytes, which copies a megabyte page a dozen times.
+func readBody(r io.Reader, limit, declared int64) ([]byte, error) {
+	size := min(limit, 32<<10)
+	if declared >= 0 {
+		size = min(limit, declared, trustDeclared)
+		// Room past the declared end, so the read that meets EOF needs no growth.
+		size += min(bytes.MinRead, limit-size)
+	}
+	buf := make([]byte, 0, size)
+	for int64(len(buf)) < limit {
+		if len(buf) == cap(buf) {
+			buf = slices.Grow(buf, int(min(int64(len(buf)), limit-int64(len(buf)))))
+		}
+		n, err := r.Read(buf[len(buf):min(int64(cap(buf)), limit)])
+		buf = buf[:len(buf)+n]
+		if err == io.EOF {
+			return buf, nil
+		}
+		if err != nil {
+			return buf, err
+		}
+	}
+	return buf, nil
 }
 
 func (p *Prober) recordResponse(rec *metrics.Recorder, resp *http.Response, size int64, reused bool) {
@@ -439,7 +512,7 @@ func (p *Prober) recordResponse(rec *metrics.Recorder, resp *http.Response, size
 		}
 	}
 	if p.cfg.ExposeFinalURL && resp.Request != nil && resp.Request.URL != nil {
-		rec.Info("http_final_url_info", resp.Request.URL.String())
+		rec.Info("http_final_url_info", resp.Request.URL.Redacted())
 	}
 }
 

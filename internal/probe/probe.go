@@ -60,6 +60,10 @@ type Request struct {
 	// Hostname overrides the name the probe presents — the Host header and the
 	// SNI — without changing the address it dials. Empty means the target's own.
 	Hostname string
+	// Capture, when set, asks the prober to hand back what the target
+	// answered. Only an on-demand run sets it: a scheduled one has nobody to
+	// hand it to.
+	Capture *Capture
 }
 
 // ServerName is the name to present to the target. Overriding it is how one
@@ -69,8 +73,12 @@ func (r Request) ServerName() string { return cmp.Or(r.Hostname, r.Target.Host) 
 
 // Dialer returns a dialer bound to the request's source address. The local
 // address must be of the network dialled, or the dial is refused as mismatched.
+// A capturing request's dialer vets every address it connects to.
 func (r Request) Dialer(network string) *net.Dialer {
 	d := &net.Dialer{}
+	if r.Capture != nil {
+		d.Control = r.Capture.control()
+	}
 	if !r.SourceIP.IsValid() {
 		return d
 	}
@@ -121,6 +129,8 @@ type Result struct {
 	Phases []Phase
 	// Overhead is time spent elsewhere than the target, left out of probe_duration.
 	Overhead time.Duration
+	// Artifacts are what the target answered, filled only when Request.Capture is set.
+	Artifacts []Artifact
 }
 
 // Phase is one named span of a check — connect, tls, ttfb.

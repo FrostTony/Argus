@@ -64,9 +64,12 @@ type Runner struct {
 	Sem chan struct{}
 	Log *slog.Logger
 
+	// Capture asks every request of the run for artifacts; see Request.Capture.
+	Capture *Capture
+
 	// Observe, when set, receives every outcome with its error intact; the metrics
 	// keep only the reason.
-	Observe func(req Request, err error)
+	Observe func(req Request, res Result)
 
 	skipped atomic.Int64
 	panics  atomic.Int64
@@ -331,7 +334,7 @@ func (r *Runner) plan(ctx context.Context, tr *targetRun) []unit {
 				"host", tr.target.Host, "err", Message(err))
 		}
 		if r.Observe != nil {
-			r.Observe(r.request(tr.target, Backend{}), err)
+			r.Observe(r.request(tr.target, Backend{}), Result{Err: err})
 		}
 		return nil
 	}
@@ -391,7 +394,10 @@ func (r *Runner) probeAll(ctx context.Context, units []unit) {
 }
 
 func (r *Runner) request(t Target, b Backend) Request {
-	return Request{Target: t, Backend: b, Buckets: r.Buckets, SourceIP: r.SourceIP, Hostname: r.Hostname}
+	return Request{
+		Target: t, Backend: b, Buckets: r.Buckets,
+		SourceIP: r.SourceIP, Hostname: r.Hostname, Capture: r.Capture,
+	}
 }
 
 func (r *Runner) acquire(ctx context.Context) bool {
@@ -548,7 +554,7 @@ func (r *Runner) probeOne(ctx context.Context, req Request, rec *metrics.Recorde
 	}
 
 	if r.Observe != nil {
-		r.Observe(req, res.Err)
+		r.Observe(req, res)
 	}
 	ok := res.OK()
 	if ok {

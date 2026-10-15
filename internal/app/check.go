@@ -46,6 +46,8 @@ type BackendCheck struct {
 	Error   string             `json:"error,omitempty"`
 	Phases  map[string]float64 `json:"phases,omitempty"`
 	Metrics map[string]any     `json:"metrics,omitempty"`
+	// Artifacts are what the backend answered, with capture asked for.
+	Artifacts []probe.Artifact `json:"artifacts,omitempty"`
 }
 
 // CheckRequest asks for one ad-hoc run.
@@ -59,6 +61,8 @@ type CheckRequest struct {
 	// target's own — blackbox's hostname=.
 	Hostname string
 	Debug    bool
+	// Capture hands back what the target answered, for the probers that can.
+	Capture bool
 }
 
 // Check runs one probe once and returns the result without touching the store.
@@ -147,6 +151,12 @@ func (a *App) checkOnce(ctx context.Context, req CheckRequest) (*probe.Runner, *
 	if err != nil {
 		return nil, nil, nil, 0, err
 	}
+	var policy *probe.Capture
+	if req.Capture {
+		if policy, err = a.capturePolicy(); err != nil {
+			return nil, nil, nil, 0, err
+		}
+	}
 
 	var trace *traceSink
 	log := a.Log
@@ -162,6 +172,8 @@ func (a *App) checkOnce(ctx context.Context, req CheckRequest) (*probe.Runner, *
 	runner.Log = log
 	// A one-off check answers now: the schedule is about the periodic run.
 	runner.Schedule = nil
+	runner.Capture = policy
+	runner.Sem = a.adhoc
 
 	capture := &captureSink{}
 	runner.Observe = capture.observe
@@ -208,6 +220,11 @@ func (a *App) checkConfig(req CheckRequest) (config.Probe, error) {
 	if pc.Targets.Empty() {
 		return pc, fmt.Errorf("probe %q has no targets and none was given", pc.Name)
 	}
+	// Every answer is held until the reply is written: a probe over an
+	// inventory would hold the inventory.
+	if req.Capture && (len(pc.Targets.Static) != 1 || pc.Targets.File != nil || pc.Targets.HTTP != nil) {
+		return pc, fmt.Errorf("capture is for one target: name it with target=")
+	}
 	if pc.Timeout == 0 {
 		pc.Timeout = a.Cfg.Probing.Timeout
 	}
@@ -217,6 +234,18 @@ func (a *App) checkConfig(req CheckRequest) (config.Probe, error) {
 	enabled := false
 	pc.Disabled = &enabled
 	return pc, nil
+}
+
+// capturePolicy is what this node lets a capture read.
+func (a *App) capturePolicy() (*probe.Capture, error) {
+	switch a.Cfg.HTTP.API.Capture {
+	case config.CaptureOff:
+		return nil, fmt.Errorf("capture is off on this node (http.api.capture)")
+	case config.CaptureAll:
+		return &probe.Capture{}, nil
+	default:
+		return &probe.Capture{Allow: probe.Public}, nil
+	}
 }
 
 // probeConfig finds a configured probe by name, with inheritance applied.
@@ -258,7 +287,8 @@ type captureSink struct {
 	// errs holds the failure behind each result, keyed by target and backend.
 	// The error rather than its text: the classification on it answers what
 	// kind of check failed, which the message only describes.
-	errs map[key]error
+	errs      map[key]error
+	artifacts map[key][]probe.Artifact
 }
 
 type key struct{ target, backend string }
@@ -275,20 +305,30 @@ func (c *captureSink) collected() []metrics.Sample {
 	return slices.Clone(c.samples)
 }
 
-func (c *captureSink) observe(req probe.Request, err error) {
-	if err == nil {
+func (c *captureSink) observe(req probe.Request, res probe.Result) {
+	if res.Err == nil && len(res.Artifacts) == 0 {
 		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.errs == nil {
-		c.errs = map[key]error{}
 	}
 	var backend string
 	if req.Backend.Valid() {
 		backend = req.Backend.String()
 	}
-	c.errs[key{req.Target.Name, backend}] = err
+	k := key{req.Target.Name, backend}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if res.Err != nil {
+		if c.errs == nil {
+			c.errs = map[key]error{}
+		}
+		c.errs[k] = res.Err
+	}
+	if len(res.Artifacts) > 0 {
+		if c.artifacts == nil {
+			c.artifacts = map[key][]probe.Artifact{}
+		}
+		c.artifacts[k] = res.Artifacts
+	}
 }
 
 // targets regroups the flat sample stream by target and backend.
@@ -338,8 +378,9 @@ func (c *captureSink) targets() []TargetCheck {
 		tc := target(k.target)
 		entry := byKey[k]
 		if err := c.errs[k]; err != nil {
-			entry.Error = err.Error()
+			entry.Error = probe.Message(err)
 		}
+		entry.Artifacts = c.artifacts[k]
 		tc.Backends = append(tc.Backends, *entry)
 	}
 	// A target that never got as far as a backend reports why here.
@@ -348,7 +389,7 @@ func (c *captureSink) targets() []TargetCheck {
 			continue
 		}
 		if err, ok := c.errs[key{out[i].Target, ""}]; ok {
-			out[i].Error = err.Error()
+			out[i].Error = probe.Message(err)
 			continue
 		}
 		out[i].Error = "the target produced no result"

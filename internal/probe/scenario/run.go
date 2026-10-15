@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tonyamdfrost-cmd/Argus/internal/metrics"
 	"github.com/tonyamdfrost-cmd/Argus/internal/probe"
@@ -116,7 +117,7 @@ func (r *run) record(st *step, out outcome, d time.Duration, err error) {
 	sr := StepReport{Name: st.name, Status: StatusPassed, Code: out.code, Attempts: out.attempts, Seconds: d.Seconds()}
 	if err != nil {
 		sr.Status = StatusFailed
-		sr.Error = r.scope.redact(probe.Message(err))
+		sr.Error = bounded(r.scope.redact(probe.Message(err)))
 	}
 	if st.cleanup {
 		r.report.Cleanup = append(r.report.Cleanup, sr)
@@ -153,7 +154,7 @@ func (r *run) step(ctx context.Context, base *url.URL, st *step) (outcome, error
 			if name != what {
 				what += " " + name // a name of its own says which condition
 			}
-			return out, probe.Fail(probe.ReasonContent, "%s held: %s", what, probe.Excerpt(resp.body))
+			return out, probe.Fail(probe.ReasonContent, "%s held: %s", what, r.scope.excerpt(resp.body))
 		}
 		pending := check(st.until, resp)
 		if pending == nil {
@@ -192,7 +193,8 @@ func (r *run) exchange(ctx context.Context, base *url.URL, st *step) (*response,
 		if errors.As(err, &unset) {
 			return nil, err
 		}
-		return nil, probe.Fail(probe.ReasonInternal, "%v", err)
+		// A failure the request already classified keeps its reason.
+		return nil, probe.Wrap(probe.ReasonInternal, err)
 	}
 	client := r.session.follow
 	if !st.req.follow {
@@ -212,9 +214,8 @@ func (r *run) exchange(ctx context.Context, base *url.URL, st *step) (*response,
 	if err != nil {
 		return nil, probe.Wrap(probe.ReasonContent, err)
 	}
-	// Masked here, once, rather than in each message built from the body:
-	// a message quotes and cuts it, and the secret in it with it.
-	out.body = r.scope.redact(out.body)
+	// The body stays as it came: checks and extracts read the answer, and a
+	// message masks what it quotes (scope.excerpt).
 	return out, nil
 }
 
@@ -259,9 +260,12 @@ func anyHolds(vs []httpprobe.Validator, resp *response) (string, bool) {
 func (r *run) extract(st *step, resp *response) error {
 	values := make(map[string]string, len(st.extract))
 	for _, x := range st.extract {
-		v, err := x.from(resp)
+		v, err := x.from(resp, r.scope)
 		if err != nil {
 			return err
+		}
+		if x.secret {
+			r.scope.hide(v, ref{nsVar, x.name}.String())
 		}
 		if x.metric {
 			f, err := strconv.ParseFloat(v, 64)
@@ -278,7 +282,7 @@ func (r *run) extract(st *step, resp *response) error {
 	return nil
 }
 
-func (x extractor) from(resp *response) (string, error) {
+func (x extractor) from(resp *response, s *scope) (string, error) {
 	switch {
 	case x.jsonPath != "":
 		doc, err := resp.json()
@@ -306,7 +310,7 @@ func (x extractor) from(resp *response) (string, error) {
 	default:
 		m := x.regex.FindStringSubmatch(resp.body)
 		if m == nil {
-			return "", probe.FailRegex("extract %s: %q does not match %q", x.name, probe.Excerpt(resp.body), x.regex)
+			return "", probe.FailRegex("extract %s: %q does not match %q", x.name, s.excerpt(resp.body), x.regex)
 		}
 		return m[len(m)-1], nil
 	}
@@ -342,7 +346,7 @@ func (r *run) finish(err error) Report {
 	rep.Seconds = time.Since(rep.Started).Seconds()
 	rep.Success = err == nil
 	if err != nil {
-		rep.Error = probe.Message(err)
+		rep.Error = bounded(probe.Message(err))
 	}
 	for _, st := range r.sc.steps[len(rep.Steps):] {
 		rep.Steps = append(rep.Steps, StepReport{Name: st.name, Status: StatusNotRun})
@@ -358,4 +362,19 @@ func (r *run) finish(err error) Report {
 		}
 	}
 	return rep
+}
+
+// reportMax bounds a failure kept in a report: it is shown on every status
+// page until the next run, and the text in it is mostly the target's.
+const reportMax = 1 << 10
+
+func bounded(msg string) string {
+	if len(msg) <= reportMax {
+		return msg
+	}
+	n := reportMax
+	for n > 0 && !utf8.RuneStart(msg[n]) {
+		n--
+	}
+	return msg[:n] + "…"
 }

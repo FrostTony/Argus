@@ -160,7 +160,7 @@ func Convert(in []config.Target) ([]probe.Target, error) {
 			}
 		}
 		if tt.Name == "" {
-			tt.Name = cmp.Or(t.URL, t.Host)
+			tt.Name = cmp.Or(config.RedactURL(t.URL), t.Host)
 		}
 		if tt.Host == "" {
 			return nil, fmt.Errorf("target %q has no host", tt.Name)

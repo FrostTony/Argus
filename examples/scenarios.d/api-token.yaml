@@ -21,10 +21,12 @@ steps:
       client_secret: "${secret.client_secret}"
     status: 200
     extract:
-      token: {json_path: access_token}
+      # secret: masks the token in every report and keeps the steps that
+      # send it on the target, as a declared secret would be.
+      token: {json_path: access_token, secret: true}
 
-  # Headers take references like any value. The token is a var, not a
-  # secret: it comes from the answer, and lives for this run only.
+  # Headers take references like any value. The token comes from the answer
+  # and lives for this run only.
   - name: me
     get: /v1/me
     headers: {Authorization: "Bearer ${var.token}"}

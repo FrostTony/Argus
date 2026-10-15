@@ -17,6 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
@@ -133,6 +134,33 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 	return res
 }
 
+// maxRedirects is net/http's own limit, which a CheckRedirect replaces.
+const maxRedirects = 10
+
+// confine follows a redirect, keeping what a step wrote for one origin off
+// another: net/http drops only Authorization and Cookie on a hop to another
+// host, carries every other header — an API key among them — and sends a
+// 307's body again. The jar's cookies are added after this, per host.
+func confine(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("stopped after %d redirects", maxRedirects)
+	}
+	if sameOrigin(req.URL, via[0].URL) {
+		return nil
+	}
+	if req.Body != nil && req.Body != http.NoBody {
+		return fmt.Errorf("a redirect to %s://%s would send the step's body to another origin", req.URL.Scheme, req.URL.Host)
+	}
+	req.Header = http.Header{"User-Agent": {userAgent}}
+	return nil
+}
+
+// sameOrigin compares scheme, host and port: an https origin is not its http
+// counterpart, which anyone on the path can read.
+func sameOrigin(a, b *url.URL) bool {
+	return a.Scheme == b.Scheme && strings.EqualFold(a.Host, b.Host)
+}
+
 // session is what one run sends all of its steps through: one cookie jar,
 // connections kept between steps and closed when the run ends.
 type session struct {
@@ -154,7 +182,7 @@ func (p *Prober) session(req probe.Request) session {
 			return conns.Dial(ctx, dialer, network, addr)
 		},
 	}
-	follow := &http.Client{Transport: tr, Jar: jar}
+	follow := &http.Client{Transport: tr, Jar: jar, CheckRedirect: confine}
 	stay := *follow
 	stay.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return session{follow: follow, stay: &stay, close: func() {

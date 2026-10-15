@@ -27,6 +27,14 @@ info:
     **The API is off by default.** It appears only with `http.api.enabled: true`.
     Without it every path below `/api` is a 404.
 
+    **The API is for clients, not web pages.** A request a browser marks as
+    cross-site — an `Origin` of another host, `Sec-Fetch-Site: cross-site` or
+    `same-site` — is answered 403 on every `/api` path and `/probe`, whatever
+    token it carries. With `write_auth: none`, a write is taken only when the
+    `Host` is an IP address or `localhost`: a page that rebinds its own name to
+    the node sends that name. A token left as an unset `${VAR}` stops the node
+    at start.
+
 servers:
   - url: http://{host}:{port}
     variables:
@@ -277,6 +285,11 @@ paths:
         can be sent straight back in. A node started from several files answers
         a YAML stream with one document per file, which `PUT` refuses: such a
         configuration is edited on disk. Empty when there is none yet.
+
+        **Credentials are for the write token.** A read token gets the document
+        with them masked: values under keys such as `password`, `token`,
+        `secret`, `api_key`, `authorization`, `cookie`, and the password of any
+        URL become `<redacted>`; a value that is only `${VAR}` references stays.
       security: [{readToken: []}]
       responses:
         "200":
@@ -494,6 +507,7 @@ paths:
         - {$ref: "#/components/parameters/CheckTarget"}
         - {$ref: "#/components/parameters/CheckHostname"}
         - {$ref: "#/components/parameters/CheckDebug"}
+        - {$ref: "#/components/parameters/CheckCapture"}
       responses:
         "200":
           description: |
@@ -525,6 +539,7 @@ paths:
         - {$ref: "#/components/parameters/CheckTarget"}
         - {$ref: "#/components/parameters/CheckHostname"}
         - {$ref: "#/components/parameters/CheckDebug"}
+        - {$ref: "#/components/parameters/CheckCapture"}
       requestBody:
         required: false
         content:
@@ -555,6 +570,7 @@ paths:
         - {$ref: "#/components/parameters/CheckTarget"}
         - {$ref: "#/components/parameters/CheckHostname"}
         - {$ref: "#/components/parameters/CheckDebug"}
+        - {$ref: "#/components/parameters/CheckCapture"}
       requestBody:
         required: false
         content:
@@ -707,6 +723,33 @@ components:
       description: |
         Return the run's log alongside the result. The log carries what the
         target answered, so supplying it makes the request a write.
+      schema: {type: boolean, default: false}
+    CheckCapture:
+      name: capture
+      in: query
+      required: false
+      description: |
+        Return what each backend answered, as `artifacts` beside its metrics:
+        the page that explains a failure the numbers only report — a block
+        page, a WAF challenge, a parked domain. Today the `http` prober
+        answers it, with the exchange (every redirect hop, response headers
+        only) and the body as served, up to `max_body_bytes`. Probers that
+        have nothing to show ignore it.
+
+        It is for one target: every answer is held until the reply is
+        written, so a probe with several targets needs `target`. Supplying it
+        makes the request a write — it returns what the target answered.
+
+        **What it may read** is the node's `http.api.capture`: `public` (the
+        default) connects only to public addresses — never loopback,
+        link-local (where cloud metadata lives), private, carrier-grade NAT or
+        reserved space. The address is vetted on every connection, after
+        resolution, so a redirect, a proxy or a name that resolves elsewhere
+        the second time cannot carry the capture inward. `all` lifts that;
+        `off` refuses capture with 400.
+
+        A body stops at `max_body_bytes` or 2 MiB, whichever is less, and the
+        exchange at 64 KiB; `truncated` says so. The answer is compact JSON.
       schema: {type: boolean, default: false}
 
   responses:
@@ -948,7 +991,37 @@ components:
           type: object
           additionalProperties: true
           description: What the probe measured, returned inline instead of being stored.
+        artifacts:
+          type: array
+          items: {$ref: "#/components/schemas/Artifact"}
+          description: What this backend answered, with `capture=true`.
       required: [success]
+
+    Artifact:
+      type: object
+      description: Something the target answered, handed back as it came. The node keeps none of it.
+      properties:
+        name:
+          type: string
+          description: "`headers` — the exchange as text, redirects first; `body` — the response body."
+          example: body
+        media_type:
+          type: string
+          description: As the server declared it, charset included; guessed only when it declared none.
+          example: text/html; charset=windows-1251
+        url:
+          type: string
+          description: Where it came from, which a redirect may have moved off the target.
+        data:
+          type: string
+          format: byte
+          description: |
+            Base64 of the bytes as served, undecoded: a page in windows-1251 is
+            bytes, and the charset in `media_type` says how to read them.
+        truncated:
+          type: boolean
+          description: The answer went on past a limit — `max_body_bytes`, 2 MiB for a body, 64 KiB for the exchange — and `data` stops there.
+      required: [name, data]
 
     Scenario:
       type: object

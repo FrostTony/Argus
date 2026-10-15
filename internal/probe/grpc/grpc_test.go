@@ -150,3 +150,17 @@ func TestAuthorityWithPortStillVerifies(t *testing.T) {
 		t.Fatalf("authority with a port: %v", res.Err)
 	}
 }
+
+// The server's grpc-message is quoted, not copied whole, into the failure.
+func TestStatusMessageIsAnExcerpt(t *testing.T) {
+	req := h2server(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/grpc")
+		w.Header().Set("grpc-status", "13")
+		w.Header().Set("grpc-message", strings.Repeat("m", 200<<10))
+		w.WriteHeader(http.StatusOK)
+	}, nil)
+	res := newProber(t, "tls: {insecure_skip_verify: true}").Probe(context.Background(), req, metrics.NewRecorder(nil))
+	if res.Err == nil || len(res.Err.Error()) > 1024 {
+		t.Errorf("failure of %d bytes", len(res.Err.Error()))
+	}
+}

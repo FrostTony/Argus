@@ -13,6 +13,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/net/http/httpguts"
+
+	"github.com/tonyamdfrost-cmd/Argus/internal/probe"
+	httpprobe "github.com/tonyamdfrost-cmd/Argus/internal/probe/http"
 )
 
 // userAgent tells the target's owners which traffic is synthetic.
@@ -63,6 +68,11 @@ func (r *request) build(ctx context.Context, base *url.URL, s *scope) (*http.Req
 			body.close()
 			return nil, fmt.Errorf("headers.%s: %w", h.key, err)
 		}
+		// net/http refuses such a value only when sending, as a failure to connect.
+		if !httpguts.ValidHeaderFieldValue(v) {
+			body.close()
+			return nil, probe.Fail(probe.ReasonContent, "headers.%s: the value is not a valid header value", h.key)
+		}
 		// Host is no ordinary header: net/http reads it from the struct.
 		if strings.EqualFold(h.key, "host") {
 			req.Host = v
@@ -98,6 +108,12 @@ func (r *request) address(base *url.URL, s *scope) (*url.URL, error) {
 	}
 	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, fmt.Errorf("%q is not an http(s) address", raw)
+	}
+	// An address a response handed out goes where that response says; the
+	// step's secrets go only to the target, and not over a weaker scheme.
+	if r.url.whole() && r.sensitive && !sameOrigin(u, base) {
+		return nil, fmt.Errorf("%s leads to %s://%s, not the target: a step that sends a secret stays on the target",
+			r.url.refs[0], u.Scheme, u.Host)
 	}
 	if len(r.query) > 0 {
 		q := u.Query()
@@ -315,6 +331,9 @@ type response struct {
 func read(resp *http.Response, keep, limit int64) (*response, error) {
 	defer resp.Body.Close()
 	var sb strings.Builder
+	if resp.ContentLength > 0 {
+		sb.Grow(int(min(resp.ContentLength, keep, 4<<20)))
+	}
 	n, err := io.Copy(&sb, io.LimitReader(resp.Body, keep))
 	if err != nil {
 		return nil, err
@@ -326,7 +345,7 @@ func read(resp *http.Response, keep, limit int64) (*response, error) {
 func (r *response) json() (any, error) {
 	if !r.parsed {
 		r.parsed = true
-		r.jsonErr = json.Unmarshal([]byte(r.body), &r.doc)
+		r.doc, r.jsonErr = httpprobe.DecodeJSON([]byte(r.body))
 	}
 	return r.doc, r.jsonErr
 }

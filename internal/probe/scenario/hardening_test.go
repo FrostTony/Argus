@@ -122,13 +122,16 @@ func TestValueIsOneSegmentWhateverItHolds(t *testing.T) {
 		paths = append(paths, r.URL.EscapedPath())
 		mu.Unlock()
 		if r.URL.Path == "/ids" {
-			_, _ = io.WriteString(w, `{"dots": "..", "empty": "", "id": "a/b"}`)
+			_, _ = io.WriteString(w, `{"dots": "..", "empty": "", "id": "a/b", "climb": "../../admin/users/1", "back": "..\\\\admin", "param": "..;x/y"}`)
 		}
 	}))
 	defer srv.Close()
 
 	for value, want := range map[string]string{
-		"dots":  `".." cannot be a path segment`,
+		"dots":  "holds a dot segment",
+		"climb": "holds a dot segment", // a server that decodes %2F reads it as steps up
+		"back":  "holds a dot segment",
+		"param": "holds a dot segment",
 		"empty": "an empty value cannot be a path segment",
 		"id":    "",
 	} {
