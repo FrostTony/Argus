@@ -173,40 +173,37 @@ vars:
   login: argus-synthetic
 steps:
   - name: login
-    http:
-      path: /api/login
-      json: {login: "${var.login}", password: "${secret.password}"}
+    post: /api/login
+    json: {login: "${var.login}", password: "${secret.password}"}
     expect: [{status_code: [200]}]
   - name: list
-    http: {path: /api/videos}
+    get: /api/videos
     extract:
       videos: {json_path: total, metric: true}
   - name: upload
-    http:
-      path: /api/videos
-      multipart:
-        fields: {title: "argus ${run.id}"}
-        files: {video: ` + fixture + `}
+    post: /api/videos
+    multipart:
+      fields: {title: "argus ${run.id}"}
+      files: {video: ` + fixture + `}
     expect: [{status_code: [201]}]
     extract:
       video_id: {json_path: id}
   - name: convert
-    http: {path: "/api/videos/${var.video_id}"}
+    get: "/api/videos/${var.video_id}"
     until: [{json_path: status, json_equals: ready}]
     abort_if: [{json_path: status, json_equals: failed}]
     every: 10ms
     within: 5s
   - name: playback
-    http: {path: "/hls/${var.video_id}/master.m3u8"}
+    get: "/hls/${var.video_id}/master.m3u8"
     expect: [{status_code: [200], body_regex: "^#EXTM3U"}]
   - name: comment
-    http:
-      path: "/api/videos/${var.video_id}/comments"
-      json: {text: "argus ${run.id}"}
+    post: "/api/videos/${var.video_id}/comments"
+    json: {text: "argus ${run.id}"}
     expect: [{status_code: [201]}]
 cleanup:
   - name: delete
-    http: {method: DELETE, path: "/api/videos/${var.video_id}"}
+    delete: "/api/videos/${var.video_id}"
     expect: [{status_code: [204]}]
 ` + extra
 }
@@ -484,20 +481,18 @@ func TestRequestShapes(t *testing.T) {
 vars: {id: "a/b c"}
 steps:
   - name: start
-    http: {path: /start, follow_redirects: false}
+    get: /start
+    follow_redirects: false
     expect: [{status_code: [302]}]
     extract: {upload: {header: Location}}
   - name: put
-    http:
-      method: PUT
-      url: "${var.upload}"
-      body: "raw ${var.id}"
-      headers: {X-Id: "${var.id}"}
+    put: "${var.upload}"
+    body: "raw ${var.id}"
+    headers: {X-Id: "${var.id}"}
   - name: segment
-    http:
-      path: "/items/${var.id}"
-      query: {q: "${var.id}&x=1"}
-      form: {name: "${var.id}"}
+    post: "/items/${var.id}"
+    query: {q: "${var.id}&x=1"}
+    form: {name: "${var.id}"}
 `)
 	res := p.Probe(context.Background(), requestFor(t, srv), metrics.NewRecorder(nil))
 	if !res.OK() {
@@ -539,63 +534,81 @@ func TestConfigurationErrors(t *testing.T) {
 		"no steps": {`vars: {a: b}`, "at least one"},
 		"unknown variable": {`
 steps:
-  - {name: a, http: {path: "/x/${var.id}"}}`, "${var.id} is not set"},
+  - {name: a, get: "/x/${var.id}"}`, "${var.id} is not set"},
 		"set by a later step": {`
 steps:
-  - {name: a, http: {path: "/x/${var.id}"}}
-  - {name: b, http: {path: /y}, extract: {id: {json_path: id}}}`, "${var.id} is not set"},
+  - {name: a, get: "/x/${var.id}"}
+  - {name: b, get: /y, extract: {id: {json_path: id}}}`, "${var.id} is not set"},
 		"undeclared secret": {`
 steps:
-  - {name: a, http: {path: /x, headers: {X: "${secret.token}"}}}`, "not declared under secrets"},
+  - {name: a, get: /x, headers: {X: "${secret.token}"}}`, "not declared under secrets"},
 		"unset environment variable": {`
 steps:
-  - {name: a, http: {path: "/x/${API_TOKEN}"}}`, "environment variable is not set"},
+  - {name: a, get: "/x/${API_TOKEN}"}`, "environment variable is not set"},
 		"unknown run field": {`
 steps:
-  - {name: a, http: {path: "/x/${run.started}"}}`, "only ${run.id}"},
-		"path and url": {`
+  - {name: a, get: "/x/${run.started}"}`, "only ${run.id}"},
+		"two methods": {`
 steps:
-  - {name: a, http: {path: /x, url: "http://h/x"}}`, "one of them"},
-		"path that leaves": {`
+  - {name: a, get: /x, post: /y}`, "one request per step, got get and post"},
+		"no method": {`
 steps:
-  - {name: a, http: {path: "http://elsewhere/x"}}`, "is not a path"},
-		"url that is a path": {`
+  - {name: a, status: 200}`, "name the request"},
+		"body on a get": {`
 steps:
-  - {name: a, http: {url: /x}}`, "not an http(s) URL"},
+  - {name: a, get: /x, json: {a: b}}`, "a get sends none"},
+		"status names itself": {`
+steps:
+  - {name: a, get: /x, status: 2xxx}`, "a: status: invalid code"},
+		"expect keeps its index": {`
+steps:
+  - {name: a, get: /x, status: 201, expect: [{body_regex: "("}]}`, "expect[0]: body_regex"},
+		"address without a scheme": {`
+steps:
+  - {name: a, get: "//elsewhere/x"}`, "neither a path nor an http(s) URL"},
+		"not http": {`
+steps:
+  - {name: a, get: "ftp://h/x"}`, "neither a path nor an http(s) URL"},
+		"bad status": {`
+steps:
+  - {name: a, get: /x, status: [200, "abc"]}`, `invalid code "abc"`},
+		"status as a mapping": {`
+steps:
+  - {name: a, get: /x, status: {code: 200}}`, "want a code, a range or a list"},
 		"two bodies": {`
 steps:
-  - {name: a, http: {path: /x, body: b, form: {a: b}}}`, "set one of body"},
+  - {name: a, post: /x, body: b, form: {a: b}}`, "set one of body"},
 		"missing file": {`
 steps:
-  - {name: a, http: {path: /x, body_file: /nonexistent/file}}`, "no such file"},
+  - {name: a, post: /x, body_file: /nonexistent/file}`, "no such file"},
 		"file by reference": {`
 vars: {f: x}
 steps:
-  - {name: a, http: {path: /x, multipart: {files: {f: "${var.f}"}}}}`, "not by a reference"},
+  - {name: a, post: /x, multipart: {files: {f: "${var.f}"}}}`, "not by a reference"},
 		"wait without until": {`
 steps:
-  - {name: a, http: {path: /x}, every: 1s}`, "set until"},
+  - {name: a, get: /x, every: 1s}`, "set until"},
 		"duplicate step": {`
 steps:
-  - {name: a, http: {path: /x}}
+  - {name: a, get: /x}
 cleanup:
-  - {name: a, http: {path: /y}}`, "already taken"},
+  - {name: a, get: /y}`, "already taken"},
 		"two extract sources": {`
 steps:
-  - {name: a, http: {path: /x}, extract: {v: {json_path: a, header: B}}}`, "set one of"},
+  - {name: a, get: /x, extract: {v: {json_path: a, header: B}}}`, "set one of"},
 		"bad step name": {`
 steps:
-  - {name: "a b", http: {path: /x}}`, "name: want"},
+  - {name: "a b", get: /x}`, "name: want"},
 		"empty validator": {`
 steps:
-  - {name: a, http: {path: /x}, expect: [{name: nothing}]}`, "checks nothing"},
+  - {name: a, get: /x, expect: [{name: nothing}]}`, "checks nothing"},
 		"secret with both": {`
 secrets: {t: {file: ` + file + `, env: T}}
 steps:
-  - {name: a, http: {path: /x}}`, "one of them"},
+  - {name: a, get: /x}`, "one of them"},
 		"unknown field": {`
 steps:
-  - {name: a, http: {path: /x}, retries: 3}`, "retries"},
+  - {name: a, get: /x, retries: 3}`, "retries"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -610,10 +623,10 @@ steps:
 func TestCleanupMaySpeakOfAnyStepsVariable(t *testing.T) {
 	_, err := build(`
 steps:
-  - {name: a, http: {path: /x}, extract: {id: {json_path: id}}}
+  - {name: a, get: /x, extract: {id: {json_path: id}}}
 cleanup:
-  - {name: z, http: {method: DELETE, path: "/x/${var.id}"}}
-  - {name: y, http: {method: DELETE, path: "/x/${var.typo}"}}`)
+  - {name: z, delete: "/x/${var.id}"}
+  - {name: y, delete: "/x/${var.typo}"}`)
 	if err == nil || !strings.Contains(err.Error(), "cleanup[1]") || !strings.Contains(err.Error(), "${var.typo}") {
 		t.Errorf("err = %v: a variable no step sets is a typo, even in cleanup", err)
 	}

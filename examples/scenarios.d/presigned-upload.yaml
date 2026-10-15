@@ -1,0 +1,51 @@
+# An upload that goes around the API: the API hands out a presigned URL, the
+# file goes straight to object storage, and the API is told it has arrived.
+# Three services, and a broken bucket policy shows only on the second step.
+#
+# A host only you have: disabled until pointed at your own API.
+disabled: true
+
+interval: 30m
+timeout: 2m
+targets: [https://files.example/]
+
+secrets:
+  api_key: {file: /run/secrets/argus-files-key}
+
+steps:
+  - name: request
+    post: /api/uploads
+    headers: {X-Api-Key: "${secret.api_key}"}
+    json: {filename: "argus-${run.id}.csv", content_type: text/csv}
+    status: 201
+    extract:
+      upload_url: {json_path: upload_url}
+      file_id: {json_path: id}
+
+  # An address that is one reference is taken whole, query and signature
+  # included. Headers go where the address points: the API key stays off this
+  # request, which leaves for the storage. The file is streamed from disk with
+  # its length up front, which a presigned PUT requires.
+  - name: put
+    put: "${var.upload_url}"
+    body_file: fixtures/report.csv
+    headers: {Content-Type: text/csv}
+    status: 200
+
+  - name: complete
+    post: "/api/uploads/${var.file_id}/complete"
+    headers: {X-Api-Key: "${secret.api_key}"}
+    status: [200, 204]
+
+  - name: download
+    get: "/api/files/${var.file_id}/content"
+    headers: {X-Api-Key: "${secret.api_key}"}
+    expect:
+      - {header: Content-Type, header_regex: "^text/csv"}
+      - {body_regex: "^id,name,amount"}
+
+cleanup:
+  - name: delete
+    delete: "/api/files/${var.file_id}"
+    headers: {X-Api-Key: "${secret.api_key}"}
+    status: [200, 204, 404]

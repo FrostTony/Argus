@@ -1,0 +1,38 @@
+# An API behind OAuth2 client credentials: get a token, use it. The token
+# endpoint is a service of its own, and a token that is issued but refused by
+# the API — a key rotated on one side only — shows only when both are walked.
+#
+# A host only you have: disabled until pointed at your own API.
+disabled: true
+
+interval: 5m
+timeout: 30s
+targets: [https://api.example/]
+
+secrets:
+  client_secret: {file: /run/secrets/argus-api-client}
+
+steps:
+  - name: token
+    post: https://auth.example/oauth/token
+    form:
+      grant_type: client_credentials
+      client_id: argus-synthetic
+      client_secret: "${secret.client_secret}"
+    status: 200
+    extract:
+      token: {json_path: access_token}
+
+  # Headers take references like any value. The token is a var, not a
+  # secret: it comes from the answer, and lives for this run only.
+  - name: me
+    get: /v1/me
+    headers: {Authorization: "Bearer ${var.token}"}
+    expect: [{json_path: client_id, json_equals: argus-synthetic}]
+
+  - name: quota
+    get: /v1/quota
+    headers: {Authorization: "Bearer ${var.token}"}
+    extract:
+      # A number to graph: scenario_value{step="quota",name="remaining"}.
+      remaining: {json_path: requests.remaining, metric: true}

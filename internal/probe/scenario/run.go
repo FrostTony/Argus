@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/tonyamdfrost-cmd/Argus/internal/metrics"
@@ -293,6 +295,13 @@ func (x extractor) from(resp *response) (string, error) {
 		if v == "" {
 			return "", probe.Fail(probe.ReasonContent, "extract %s: the answer has no %s header", x.name, x.header)
 		}
+		// A relative Location is relative to the request that got it, as a
+		// browser reads it — not to the target, which may be another host.
+		if strings.EqualFold(x.header, "Location") {
+			if u, err := resp.Location(); err == nil {
+				v = u.String()
+			}
+		}
 		return v, nil
 	default:
 		m := x.regex.FindStringSubmatch(resp.body)
@@ -325,7 +334,9 @@ func (r *run) redact(err error) error {
 }
 
 // finish completes the report: the steps a failure kept from running are
-// listed too, so a report always shows the whole scenario.
+// listed too, so a report always shows the whole scenario. Every step's
+// failure counter moves by its outcome, 0 included, so each series is there
+// from the first run and increase() over it reads every run.
 func (r *run) finish(err error) Report {
 	rep := r.report
 	rep.Seconds = time.Since(rep.Started).Seconds()
@@ -338,6 +349,13 @@ func (r *run) finish(err error) Report {
 	}
 	for _, st := range r.sc.cleanup[len(rep.Cleanup):] {
 		rep.Cleanup = append(rep.Cleanup, StepReport{Name: st.name, Status: StatusNotRun})
+	}
+	// A nil recorder is what made a run panic; finish still has a report
+	// to keep.
+	if r.rec != nil {
+		for _, sr := range slices.Concat(rep.Steps, rep.Cleanup) {
+			r.rec.Count(SeriesStepFailures, metrics.Bool(sr.Status == StatusFailed), "step", sr.Name)
+		}
 	}
 	return rep
 }

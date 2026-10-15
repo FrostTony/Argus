@@ -1,0 +1,52 @@
+# A background job: ask for an export, wait for it, download it. The step that
+# waits is the job queue's latency — probe_phase_last_duration_seconds
+# {phase="wait"} — and a queue that has stopped shows as that step timing out
+# while every endpoint still answers.
+#
+# A host only you have: disabled until pointed at your own API.
+disabled: true
+
+interval: 15m
+timeout: 6m
+targets: [https://reports.example/]
+
+secrets:
+  token: {env: REPORTS_API_TOKEN}
+
+steps:
+  # 202 Accepted and a Location: where the job will be.
+  - name: start
+    post: /api/exports
+    headers: {Authorization: "Bearer ${secret.token}"}
+    json: {report: daily-sales, format: csv}
+    status: 202
+    extract:
+      job: {header: Location}
+
+  # A relative Location is taken against the request that got it, as a
+  # browser reads it.
+  # Asked every 5s until done; a failed job ends the wait at once.
+  - name: wait
+    get: "${var.job}"
+    headers: {Authorization: "Bearer ${secret.token}"}
+    until: [{json_path: state, json_equals: done}]
+    abort_if: [{json_path: state, json_regex: "^(failed|cancelled)$"}]
+    every: 5s
+    within: 5m
+    extract:
+      download: {json_path: result.url}
+
+  # The result is a presigned link to storage: it carries its own signature,
+  # and the API's token stays off a request that leaves for another host. A
+  # report with nothing in it is a failure the status code does not show.
+  - name: download
+    get: "${var.download}"
+    expect:
+      - {header: Content-Type, header_regex: "^text/csv"}
+      - {min_size_bytes: 64}
+
+cleanup:
+  - name: delete
+    delete: "${var.job}"
+    headers: {Authorization: "Bearer ${secret.token}"}
+    status: [200, 204, 404]

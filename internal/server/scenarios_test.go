@@ -43,7 +43,7 @@ func newScenarioNode(t *testing.T) *scenarioNode {
 
 	dir := t.TempDir()
 	body := "interval: 1h\ntimeout: 30s\ntargets: [" + backend.URL + "]\n" +
-		"steps:\n  - {name: login, http: {path: /login}}\n"
+		"steps:\n  - {name: login, get: /login}\n"
 	if err := os.WriteFile(filepath.Join(dir, "pipeline.yaml"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +203,7 @@ func TestLastRunsFollowTheTargets(t *testing.T) {
 
 	dir := t.TempDir()
 	body := "interval: 1h\ntimeout: 30s\ntargets: [" + before.Targets[0] + "/moved]\n" +
-		"steps:\n  - {name: login, http: {path: /login}}\n"
+		"steps:\n  - {name: login, get: /login}\n"
 	if err := os.WriteFile(filepath.Join(dir, "pipeline.yaml"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}

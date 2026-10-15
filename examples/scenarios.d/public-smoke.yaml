@@ -1,0 +1,34 @@
+# The smallest useful scenario: a walk through a public site that changes
+# nothing, so it needs no session and no cleanup. Three requests a user makes
+# in a row — the page, a search, a result — where three http probes would
+# check three pages that each work on their own.
+#
+# A host only you have: disabled until pointed at your own site.
+disabled: true
+
+interval: 5m
+timeout: 1m
+# Each target gets a run of its own, side by side, each with its own session:
+# the same walk against production and staging, told apart by the target label.
+targets:
+  - https://shop.example/
+  - https://staging.shop.example/
+
+steps:
+  - name: home
+    get: /
+    expect: [{body_regex: "<title>[^<]*Shop"}]
+
+  # query: encodes its values; a value put into the address itself would not be.
+  - name: search
+    get: /search
+    query: {q: "coffee grinder"}
+    expect: [{body_regex: 'class="product-card"'}]
+    extract:
+      product: {regex: 'href="/p/([a-z0-9-]+)"'}
+
+  - name: product
+    get: "/p/${var.product}"
+    expect:
+      - {body_regex: "Add to cart"}
+      - {max_size_bytes: 2097152}

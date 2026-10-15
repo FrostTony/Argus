@@ -14,7 +14,7 @@ run_on: ^msk-
 labels: {team: video}
 targets: [https://admin.example/]
 steps:
-  - {name: login, http: {path: /login}}
+  - {name: login, get: /login}
 `
 
 func TestScenarioFileIsAProbe(t *testing.T) {

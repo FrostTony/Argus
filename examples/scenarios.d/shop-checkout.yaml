@@ -1,0 +1,70 @@
+# A purchase, end to end, against a store's sandbox: find a product, put it in
+# a cart, pay with a test card, see the order paid — then cancel it. Search,
+# cart, payments and orders are four services, and this is the path money
+# takes through them.
+#
+# A host only you have: disabled until pointed at your own store's sandbox.
+disabled: true
+
+interval: 30m
+timeout: 3m
+# One node is enough: every run places an order.
+run_on: ^msk-1$
+targets: [https://sandbox.shop.example/]
+
+secrets:
+  api_key: {file: /run/secrets/argus-shop-key}
+
+vars:
+  # The payment provider's test card: accepted, never charged.
+  card: "4242424242424242"
+
+steps:
+  # json_path indexes arrays with a number: items.0 is the first result. An
+  # empty result fails the extract, which is the check that something was found.
+  - name: search
+    get: /api/products
+    query: {q: "coffee grinder", in_stock: "true"}
+    headers: {X-Api-Key: "${secret.api_key}"}
+    extract:
+      product: {json_path: items.0.id}
+      price: {json_path: items.0.price, metric: true}
+
+  - name: cart
+    post: /api/carts
+    headers: {X-Api-Key: "${secret.api_key}"}
+    json: {items: [{product_id: "${var.product}", quantity: 1}]}
+    status: 201
+    extract:
+      cart: {json_path: id}
+
+  - name: checkout
+    post: "/api/carts/${var.cart}/checkout"
+    headers: {X-Api-Key: "${secret.api_key}", Idempotency-Key: "argus-${run.id}"}
+    json: {payment: {card: "${var.card}", exp: "12/30", cvc: "123"}, note: "argus ${run.id}"}
+    status: 201
+    extract:
+      order: {json_path: order_id}
+
+  # Payment is asynchronous: the order goes pending → paid.
+  - name: paid
+    get: "/api/orders/${var.order}"
+    headers: {X-Api-Key: "${secret.api_key}"}
+    until: [{json_path: status, json_equals: paid}]
+    abort_if: [{json_path: status, json_regex: "^(declined|failed)$"}]
+    every: 3s
+    within: 1m
+
+# Each removes something of its own, and runs whatever became of the other:
+# a cart from a run that failed at checkout is a leftover too. After a good
+# checkout the cart is already gone or locked to its order: 404 and 409 are
+# what a clean store answers, not failures.
+cleanup:
+  - name: cancel
+    post: "/api/orders/${var.order}/cancel"
+    headers: {X-Api-Key: "${secret.api_key}"}
+    status: [200, 409]
+  - name: drop-cart
+    delete: "/api/carts/${var.cart}"
+    headers: {X-Api-Key: "${secret.api_key}"}
+    status: [204, 404, 409]

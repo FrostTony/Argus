@@ -230,20 +230,18 @@ secrets:
 
 steps:
   - name: login
-    http:
-      path: /api/login
-      json: {login: argus-synthetic, password: "${secret.password}"}
-    expect: [{status_code: [200]}]
+    post: /api/login
+    json: {login: argus-synthetic, password: "${secret.password}"}
+    status: 200
   - name: upload
-    http:
-      path: /api/videos
-      multipart:
-        fields: {title: "argus ${run.id}"}
-        files: {video: fixtures/sample.mp4}
-    expect: [{status_code: [201]}]
+    post: /api/videos
+    multipart:
+      fields: {title: "argus ${run.id}"}
+      files: {video: fixtures/sample.mp4}
+    status: 201
     extract: {video_id: {json_path: id}}
   - name: convert
-    http: {path: "/api/videos/${var.video_id}"}
+    get: "/api/videos/${var.video_id}"
     until: [{json_path: status, json_equals: ready}]
     abort_if: [{json_path: status, json_equals: failed}]
     every: 10s
@@ -251,11 +249,21 @@ steps:
 
 cleanup:
   - name: delete
-    http: {method: DELETE, path: "/api/videos/${var.video_id}"}
+    delete: "/api/videos/${var.video_id}"
 ```
 
-[examples/scenarios.d/video-pipeline.yaml](examples/scenarios.d/video-pipeline.yaml)
-is the whole of it, commented.
+[examples/scenarios.d/](examples/scenarios.d/) has them whole and commented,
+each showing a side of the format:
+
+| Example | Shows |
+|---|---|
+| [public-smoke](examples/scenarios.d/public-smoke.yaml) | the smallest: three pages in a row, read only, two targets |
+| [web-login](examples/scenarios.d/web-login.yaml) | an HTML form with a CSRF token, a redirect checked rather than followed, logout as cleanup |
+| [api-token](examples/scenarios.d/api-token.yaml) | OAuth2 client credentials, a token carried in a header, a number to graph |
+| [video-pipeline](examples/scenarios.d/video-pipeline.yaml) | multipart upload, waiting for background processing, cleanup |
+| [presigned-upload](examples/scenarios.d/presigned-upload.yaml) | a presigned URL taken whole, a file streamed to storage elsewhere |
+| [export-job](examples/scenarios.d/export-job.yaml) | 202 and a Location polled until done, the result downloaded |
+| [shop-checkout](examples/scenarios.d/shop-checkout.yaml) | search, cart, test payment, order paid, two cleanups |
 
 **A file** takes the options that say when and where it runs, as a probe writes
 them — `interval`, `timeout` (both required), `targets`, `labels`, `run_on`,
@@ -268,12 +276,12 @@ taken from it:
 
 | Key | What |
 |---|---|
-| `http.path` / `http.url` | a path on the target, or an address anywhere — a presigned upload URL an earlier step was handed |
-| `http.method` | `GET`, or `POST` when there is a body |
-| `http.query`, `http.headers` | values are encoded for you |
-| `http.body` / `body_file` / `json` / `form` / `multipart` | at most one; files are streamed from disk with their length announced, and named relative to the scenario's file |
-| `http.follow_redirects`, `http.max_body_bytes`, `timeout` | per step |
-| `expect` | the same validators as `http` (`status_code`, `body_regex`, `json_path`+`json_equals`, …); `200-399` when absent |
+| `get` / `post` / `put` / `patch` / `delete` / `head` / `options` | the request, by its method: a path is taken against the target, a URL goes anywhere — a presigned upload address an earlier step was handed |
+| `query`, `headers` | values are encoded for you |
+| `body` / `body_file` / `json` / `form` / `multipart` | at most one; files are streamed from disk with their length announced, and named relative to the scenario's file |
+| `follow_redirects`, `max_body_bytes`, `timeout` | per step |
+| `status` | `201`, `2xx`, `"200-299"` or a list of them; `200-399` unless this or an `expect` says otherwise |
+| `expect` | the same validators as `http` (`body_regex`, `header_regex`, `json_path`+`json_equals`, size bounds, …) |
 | `extract` | `name: {json_path: a.b}`, `{header: Location}` or `{regex: "id=(\\w+)"}`; `metric: true` publishes it as `scenario_value` |
 | `until`, `every`, `within`, `abort_if` | ask again until `until` holds; `abort_if` ends the wait early |
 
@@ -283,8 +291,11 @@ another's. Every reference is checked when the file is read: a typo, a variable
 used before a step sets it, or an environment variable that is not set is a
 configuration error rather than a request sent with `${...}` in it. A value put
 into a path is one segment of it, whatever it holds — `..` included — and a
-value for the query goes under `query:`, which encodes it. A `url` that is one
-reference and nothing else is taken whole.
+value for the query goes under `query:`, which encodes it. An address that is
+one reference and nothing else is taken whole — a presigned URL is sent as it
+was signed, dots in its path included — and goes wherever it points, another
+host too. A Location extracted from an answer is taken against the request
+that got it, as a browser reads it.
 
 **Secrets** come from `file:` or `env:`, are read on every run so a rotation
 needs no reload, and are replaced by their reference in every error and report,
@@ -513,6 +524,7 @@ can report whatever it measures.
 | `scenario_step_attempts{step}` | how many times a waiting step asked | requests made before `until` held or the step gave up |
 | `scenario_value{step,name}` | a number a step read from an answer | an `extract` with `metric: true` |
 | `scenario_cleanup_success` | whether the leftovers were removed | 0 when a cleanup step that ran failed |
+| `scenario_step_failures_total{step}` | which step fails most | +1 when the step failed, +0 every other run — a step not reached included — so `increase(...[7d])` ranks the steps without gaps |
 
 ### The node itself
 

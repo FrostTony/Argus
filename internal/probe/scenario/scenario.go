@@ -42,6 +42,7 @@ const (
 	SeriesStepAttempts = "scenario_step_attempts"
 	SeriesValue        = "scenario_value"
 	SeriesCleanup      = "scenario_cleanup_success"
+	SeriesStepFailures = "scenario_step_failures_total"
 )
 
 // Prober runs one scenario. It keeps the last run of every target, which the

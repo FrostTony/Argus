@@ -23,7 +23,7 @@ const userAgent = "argus-scenario/0.1"
 func (r *request) build(ctx context.Context, base *url.URL, s *scope) (*http.Request, error) {
 	target, err := r.address(base, s)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%s: %w", r.key, err)
 	}
 	body, err := r.payload(s)
 	if err != nil {
@@ -73,40 +73,31 @@ func (r *request) build(ctx context.Context, base *url.URL, s *scope) (*http.Req
 	return req, nil
 }
 
-// address renders where the request goes. A value put into a path is one
-// segment of it, whatever it holds; a url that is one reference is taken
-// whole, being an address the target handed out.
+// address renders where the request goes, taken against the target. A value
+// put into the path is one segment of it, whatever it holds; an address that
+// is one reference is taken whole, being one the target handed out — a
+// presigned URL, a Location.
 func (r *request) address(base *url.URL, s *scope) (*url.URL, error) {
-	var u *url.URL
-	switch {
-	case r.path != nil:
-		p, err := r.path.render(s, segment)
-		if err != nil {
-			return nil, fmt.Errorf("path: %w", err)
-		}
-		ref, err := url.Parse(p)
-		if err != nil {
-			return nil, fmt.Errorf("path: %w", err)
-		}
-		if ref.Scheme != "" || ref.Host != "" {
-			return nil, fmt.Errorf("path: %q leaves the target", p)
-		}
+	var escape escaper = segment
+	if r.url.whole() {
+		escape = nil
+	}
+	raw, err := r.url.render(s, escape)
+	if err != nil {
+		return nil, err
+	}
+	ref, err := url.Parse(raw)
+	if err != nil {
+		return nil, err
+	}
+	// An absolute address is sent as it is: resolving it would clean its
+	// path, and a presigned URL's signature covers the path as it was signed.
+	u := ref
+	if !ref.IsAbs() {
 		u = base.ResolveReference(ref)
-	default:
-		var escape escaper = segment
-		if r.url.whole() {
-			escape = nil
-		}
-		raw, err := r.url.render(s, escape)
-		if err != nil {
-			return nil, fmt.Errorf("url: %w", err)
-		}
-		if u, err = url.Parse(raw); err != nil {
-			return nil, fmt.Errorf("url: %w", err)
-		}
-		if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			return nil, fmt.Errorf("url: %q is not an http(s) URL", raw)
-		}
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return nil, fmt.Errorf("%q is not an http(s) address", raw)
 	}
 	if len(r.query) > 0 {
 		q := u.Query()

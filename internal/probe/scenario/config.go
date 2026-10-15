@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"maps"
 	"mime"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -12,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/tonyamdfrost-cmd/Argus/internal/config"
 	httpprobe "github.com/tonyamdfrost-cmd/Argus/internal/probe/http"
@@ -42,28 +43,21 @@ type Secret struct {
 
 // Step is one request, the checks its answer must pass and the values taken
 // from it for the steps after.
+//
+// The request is named by its method: `get: /api/videos`. The address is taken
+// against the target when it is a path, and goes anywhere when it is a URL —
+// a presigned upload address an earlier step was handed.
 type Step struct {
-	Name    string                `yaml:"name"`
-	HTTP    Request               `yaml:"http"`
-	Expect  []httpprobe.Validator `yaml:"expect"`
-	Extract map[string]Extract    `yaml:"extract"`
-	// Until repeats the request every Every until all of these hold, for at
-	// most Within. Expect still applies to every answer.
-	Until  []httpprobe.Validator `yaml:"until"`
-	Every  config.Duration       `yaml:"every"`
-	Within config.Duration       `yaml:"within"`
-	// AbortIf ends the wait early: an answer any of these holds for is a failure.
-	AbortIf []httpprobe.Validator `yaml:"abort_if"`
-	// Timeout bounds one request of the step.
-	Timeout config.Duration `yaml:"timeout"`
-}
+	Name string `yaml:"name"`
 
-// Request is the `http:` block of a step. Path is taken against the target,
-// URL is anywhere: a presigned upload address an earlier step was handed.
-type Request struct {
-	Method  string            `yaml:"method"`
-	Path    string            `yaml:"path"`
-	URL     string            `yaml:"url"`
+	Get     string `yaml:"get"`
+	Head    string `yaml:"head"`
+	Post    string `yaml:"post"`
+	Put     string `yaml:"put"`
+	Patch   string `yaml:"patch"`
+	Delete  string `yaml:"delete"`
+	Options string `yaml:"options"`
+
 	Query   map[string]string `yaml:"query"`
 	Headers map[string]string `yaml:"headers"`
 
@@ -76,6 +70,64 @@ type Request struct {
 
 	FollowRedirects *bool `yaml:"follow_redirects"`
 	MaxBodyBytes    int64 `yaml:"max_body_bytes"`
+	// Timeout bounds one request of the step.
+	Timeout config.Duration `yaml:"timeout"`
+
+	// Status is the answer's status: 201, "2xx", "200-299" or a list of them.
+	// 200-399 unless this or an expect says otherwise.
+	Status  Codes                 `yaml:"status"`
+	Expect  []httpprobe.Validator `yaml:"expect"`
+	Extract map[string]Extract    `yaml:"extract"`
+	// Until repeats the request every Every until all of these hold, for at
+	// most Within. Status and Expect still apply to every answer.
+	Until  []httpprobe.Validator `yaml:"until"`
+	Every  config.Duration       `yaml:"every"`
+	Within config.Duration       `yaml:"within"`
+	// AbortIf ends the wait early: an answer any of these holds for is a failure.
+	AbortIf []httpprobe.Validator `yaml:"abort_if"`
+}
+
+// target is a method key and the address under it.
+type target struct{ key, address string }
+
+// request is the one method key that is set.
+func (s Step) request() (target, error) {
+	var set []target
+	for _, t := range []target{
+		{"get", s.Get}, {"head", s.Head}, {"post", s.Post}, {"put", s.Put},
+		{"patch", s.Patch}, {"delete", s.Delete}, {"options", s.Options},
+	} {
+		if t.address != "" {
+			set = append(set, t)
+		}
+	}
+	switch len(set) {
+	case 0:
+		return target{}, fmt.Errorf("name the request: get, head, post, put, patch, delete or options, with an address")
+	case 1:
+		return set[0], nil
+	}
+	return target{}, fmt.Errorf("one request per step, got %s and %s", set[0].key, set[1].key)
+}
+
+// bodiless are the methods a body sent with is a mistake rather than a request.
+var bodiless = map[string]bool{"get": true, "head": true, "options": true}
+
+// Codes is a list of status codes and ranges, written as one or as a list.
+type Codes []string
+
+func (c *Codes) UnmarshalYAML(n *yaml.Node) error {
+	items := []*yaml.Node{n}
+	if n.Kind == yaml.SequenceNode {
+		items = n.Content
+	}
+	for _, item := range items {
+		if item.Kind != yaml.ScalarNode {
+			return fmt.Errorf("line %d: status: want a code, a range or a list of them", item.Line)
+		}
+		*c = append(*c, item.Value)
+	}
+	return nil
 }
 
 // Multipart is a multipart/form-data body: text fields and files from disk.
@@ -114,11 +166,11 @@ func (c *Config) anchor(dir string) {
 	c.TLS.CACert, c.TLS.ClientCert, c.TLS.ClientKey = abs(c.TLS.CACert), abs(c.TLS.ClientCert), abs(c.TLS.ClientKey)
 	for _, steps := range [][]Step{c.Steps, c.Cleanup} {
 		for i := range steps {
-			r := &steps[i].HTTP
-			r.BodyFile = abs(r.BodyFile)
-			if r.Multipart != nil {
-				for field, p := range r.Multipart.Files {
-					r.Multipart.Files[field] = abs(p)
+			st := &steps[i]
+			st.BodyFile = abs(st.BodyFile)
+			if st.Multipart != nil {
+				for field, p := range st.Multipart.Files {
+					st.Multipart.Files[field] = abs(p)
 				}
 			}
 		}
@@ -180,7 +232,7 @@ type step struct {
 
 type request struct {
 	method   string
-	path     *template
+	key      string // the method as the step names it, for errors
 	url      *template
 	query    []pair
 	headers  []pair
@@ -298,18 +350,29 @@ func compileStep(sc Step, defs definitions, cleanup bool) (*step, error) {
 	}
 	wrap := func(err error) error { return fmt.Errorf("%s: %w", sc.Name, err) }
 
-	req, err := compileRequest(sc.HTTP, defs)
+	req, err := compileRequest(sc, defs)
 	if err != nil {
-		return nil, wrap(fmt.Errorf("http.%w", err))
+		return nil, wrap(err)
 	}
 	st.req = req
 
-	expect := sc.Expect
-	if len(expect) == 0 {
-		expect = []httpprobe.Validator{httpprobe.DefaultValidator()}
-	}
-	if st.expect, err = validators("expect", expect); err != nil {
+	if st.expect, err = validators("expect", sc.Expect); err != nil {
 		return nil, wrap(err)
+	}
+	// The status comes first, being the first thing wrong with most answers.
+	// Compiled on its own, so an error in it names it and not an expect.
+	status := httpprobe.DefaultValidator()
+	switch {
+	case len(sc.Status) > 0:
+		status.StatusCode = sc.Status
+	case slices.ContainsFunc(st.expect, func(v httpprobe.Validator) bool { return len(v.StatusCode) > 0 }):
+		status.StatusCode = nil // an expect says what the status should be
+	}
+	if len(status.StatusCode) > 0 {
+		if err := status.Compile(); err != nil {
+			return nil, wrap(fmt.Errorf("status: %w", err))
+		}
+		st.expect = slices.Insert(st.expect, 0, status)
 	}
 	if st.until, err = validators("until", sc.Until); err != nil {
 		return nil, wrap(err)
@@ -383,46 +446,37 @@ func compileExtract(name string, e Extract) (extractor, error) {
 	return x, nil
 }
 
-func compileRequest(r Request, defs definitions) (request, error) {
+// compileRequest reads the request half of a step.
+func compileRequest(r Step, defs definitions) (request, error) {
+	t, err := r.request()
+	if err != nil {
+		return request{}, err
+	}
 	out := request{
-		method:  strings.ToUpper(r.Method),
+		method:  strings.ToUpper(t.key),
+		key:     t.key,
 		follow:  r.FollowRedirects == nil || *r.FollowRedirects,
 		maxBody: r.MaxBodyBytes,
 	}
 	if out.maxBody <= 0 {
 		out.maxBody = defaultMaxBody
 	}
-
-	var err error
-	switch {
-	case (r.Path == "") == (r.URL == ""):
-		return out, fmt.Errorf("path: set path (on the target) or url (anywhere), one of them")
-	case r.Path != "":
-		if out.path, err = checkedTemplate("path", r.Path, defs); err != nil {
-			return out, err
+	address, field := t.address, t.key
+	if out.url, err = checkedTemplate(field, address, defs); err != nil {
+		return out, err
+	}
+	// An address that is one reference is taken whole when the run has it;
+	// query: would re-encode its query, and a signed one with it.
+	if out.url.whole() && len(r.Query) > 0 {
+		return out, fmt.Errorf("query: an address taken whole keeps its own query, signature included")
+	}
+	if !out.url.whole() {
+		absolute, err := checkURL(address)
+		if err == nil {
+			err = out.url.inPath(address, absolute)
 		}
-		if err := checkURL(r.Path, false); err != nil {
-			return out, fmt.Errorf("path: %w", err)
-		}
-		if err := out.path.inPath(r.Path, false); err != nil {
-			return out, fmt.Errorf("path: %w", err)
-		}
-	default:
-		if out.url, err = checkedTemplate("url", r.URL, defs); err != nil {
-			return out, err
-		}
-		// A url that is one reference is taken whole when the run has it;
-		// query: would re-encode its query, and a signed one with it.
-		if out.url.whole() && len(r.Query) > 0 {
-			return out, fmt.Errorf("query: a url taken whole keeps its own query, signature included")
-		}
-		if !out.url.whole() {
-			if err := checkURL(r.URL, true); err != nil {
-				return out, fmt.Errorf("url: %w", err)
-			}
-			if err := out.url.inPath(r.URL, true); err != nil {
-				return out, fmt.Errorf("url: %w", err)
-			}
+		if err != nil {
+			return out, fmt.Errorf("%s: %w", field, err)
 		}
 	}
 	if out.query, err = pairs("query", r.Query, defs); err != nil {
@@ -440,6 +494,9 @@ func compileRequest(r Request, defs definitions) (request, error) {
 	}
 	if bodies > 1 {
 		return out, fmt.Errorf("body: set one of body, body_file, json, form, multipart")
+	}
+	if bodies > 0 && bodiless[t.key] {
+		return out, fmt.Errorf("body: a %s sends none; did you mean post?", t.key)
 	}
 	switch {
 	case r.Body != "":
@@ -472,13 +529,6 @@ func compileRequest(r Request, defs definitions) (request, error) {
 				return out, fmt.Errorf("multipart.files.%s: %w", field, err)
 			}
 			out.files = append(out.files, filePart{field, path, contentType(path)})
-		}
-	}
-	if out.method == "" {
-		// As curl does: a body means it is meant to be sent.
-		out.method = http.MethodGet
-		if bodies > 0 {
-			out.method = http.MethodPost
 		}
 	}
 	return out, nil
@@ -538,20 +588,20 @@ func compileJSON(v any, defs definitions) (any, error) {
 	return v, nil
 }
 
-// checkURL parses a URL with every reference standing in as a plain word, which
-// is what the shape has to survive: a path stays on the target, a url leaves it.
-func checkURL(s string, absolute bool) error {
+// checkURL parses an address with every reference standing in as a plain
+// word, which is what its shape has to survive, and reports whether it is a
+// URL of its own rather than a path on the target.
+func checkURL(s string) (absolute bool, err error) {
 	u, err := url.Parse(refPattern.ReplaceAllString(s, "x"))
-	if err != nil {
-		return err
-	}
 	switch {
-	case absolute && (u.Scheme != "http" && u.Scheme != "https" || u.Host == ""):
-		return fmt.Errorf("%q is not an http(s) URL; a path on the target goes in path", s)
-	case !absolute && (u.Scheme != "" || u.Host != ""):
-		return fmt.Errorf("%q is not a path; an address elsewhere goes in url", s)
+	case err != nil:
+		return false, err
+	case u.Scheme == "" && u.Host == "":
+		return false, nil
+	case u.Scheme != "http" && u.Scheme != "https" || u.Host == "":
+		return false, fmt.Errorf("%q is neither a path nor an http(s) URL", s)
 	}
-	return nil
+	return true, nil
 }
 
 // readable checks a file the scenario sends when it is built, not minutes into

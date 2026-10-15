@@ -37,18 +37,21 @@ vars:
 
 cleanup_timeout: 1m
 
+# A step names its request by its method — get, post, put, patch, delete,
+# head, options — and the address under it: a path is the target's, a URL
+# is anywhere. status is what the answer must say (200-399 when left out);
+# expect checks the rest of it.
 steps:
   # A session is one client: the cookie this sets is sent by every step after.
   - name: login
-    http:
-      path: /api/login
-      json: {login: "${var.login}", password: "${secret.password}"}
-    expect: [{status_code: [200]}]
+    post: /api/login
+    json: {login: "${var.login}", password: "${secret.password}"}
+    status: 200
 
   # metric: true publishes the number as scenario_value{name="videos"} — for
   # a graph, not an assertion: a list that keeps changing is what it is for.
   - name: list
-    http: {path: /api/videos}
+    get: /api/videos
     extract:
       videos: {json_path: total, metric: true}
 
@@ -56,12 +59,11 @@ steps:
   # streamed from disk with their length announced up front. ${run.id} tells
   # one run's leftovers from another's.
   - name: upload
-    http:
-      path: /api/videos
-      multipart:
-        fields: {title: "argus ${run.id}"}
-        files: {video: fixtures/sample.mp4}
-    expect: [{status_code: [201]}]
+    post: /api/videos
+    multipart:
+      fields: {title: "argus ${run.id}"}
+      files: {video: fixtures/sample.mp4}
+    status: 201
     extract:
       video_id: {json_path: id}
 
@@ -69,26 +71,26 @@ steps:
   # probe_phase_last_duration_seconds{phase="convert"}, is the conversion time.
   # abort_if ends the wait at once when the answer cannot get better.
   - name: convert
-    http: {path: "/api/videos/${var.video_id}"}
+    get: "/api/videos/${var.video_id}"
     until: [{json_path: status, json_equals: ready}]
     abort_if: [{json_path: status, json_equals: failed}]
     every: 10s
     within: 5m
 
   - name: playback
-    http: {path: "/hls/${var.video_id}/master.m3u8"}
-    expect: [{status_code: [200], body_regex: "^#EXTM3U"}]
+    get: "/hls/${var.video_id}/master.m3u8"
+    status: 200
+    expect: [{body_regex: "^#EXTM3U"}]
 
   - name: comment
-    http:
-      path: "/api/videos/${var.video_id}/comments"
-      json: {text: "argus ${run.id}"}
-    expect: [{status_code: [201]}]
+    post: "/api/videos/${var.video_id}/comments"
+    json: {text: "argus ${run.id}"}
+    status: 201
 
 # Runs however the steps ended, under its own deadline. A step that needs a
 # variable no step got as far as setting — the upload failed, so there is no
 # video_id — is skipped rather than failed.
 cleanup:
   - name: delete
-    http: {method: DELETE, path: "/api/videos/${var.video_id}"}
-    expect: [{status_code: ["200-299"]}]
+    delete: "/api/videos/${var.video_id}"
+    status: 2xx

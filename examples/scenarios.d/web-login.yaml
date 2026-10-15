@@ -1,0 +1,47 @@
+# Logging in through the form a person uses, CSRF token and all, and seeing
+# the page behind it. An API that answers 200 says nothing about a login page
+# whose session store is down.
+#
+# A host only you have: disabled until pointed at your own admin.
+disabled: true
+
+interval: 10m
+timeout: 1m
+targets: [https://admin.example/]
+
+secrets:
+  password: {env: ADMIN_SYNTHETIC_PASSWORD}
+
+steps:
+  # The form carries a token the POST has to send back: a regex with one
+  # group takes it out of the page.
+  - name: form
+    get: /login
+    extract:
+      csrf: {regex: 'name="csrf_token" value="([^"]+)"'}
+
+  # A login answers with a redirect. Not followed, it is the thing checked:
+  # 302 to the dashboard is a success, 302 back to /login?next=/dashboard is a
+  # wrong password — hence the anchor.
+  - name: login
+    post: /login
+    form: {username: argus-synthetic, password: "${secret.password}", csrf_token: "${var.csrf}"}
+    follow_redirects: false
+    status: 302
+    expect: [{header: Location, header_regex: "^(https?://[^/]+)?/dashboard"}]
+
+  # The cookie the login set is in the session's jar. Frameworks issue a new
+  # CSRF token once signed in, so the one logout needs is taken from here.
+  - name: dashboard
+    get: /dashboard
+    expect: [{body_regex: "Signed in as argus-synthetic"}]
+    extract:
+      session_csrf: {regex: 'name="csrf_token" value="([^"]+)"'}
+
+# Logging out is the cleanup: a session per run left open is a session table
+# that only grows. Its redirect is followed, so the answer is the page after.
+cleanup:
+  - name: logout
+    post: /logout
+    form: {csrf_token: "${var.session_csrf}"}
+    status: 200
