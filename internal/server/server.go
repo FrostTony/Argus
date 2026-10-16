@@ -87,6 +87,8 @@ func New(a *app.App, files Files) (*http.Server, error) {
 		mux.Handle("/api/scenarios", api.read(api.scenarios))
 		mux.Handle("/api/scenarios/{name}", api.read(api.scenario))
 		mux.Handle("/api/scenarios/{name}/run", api.write(api.runScenario))
+		mux.Handle("/api/scenario-trials", api.write(api.tryScenario))
+		mux.Handle("/api/scenario-trials/{id}", api.read(api.trial))
 		if cfg.ProbeEndpoint {
 			mux.Handle("/probe", http.HandlerFunc(api.probeExposition))
 		}
@@ -519,6 +521,61 @@ func (s *api) runScenario(w http.ResponseWriter, r *http.Request) {
 	// A run changes things on the target: who asked for it belongs in the log.
 	s.app.Log.Info("scenario started via api", "scenario", name, "from", clientOf(r))
 	writeJSON(w, http.StatusAccepted, map[string]string{"started": name, "status": "/api/scenarios/" + name})
+}
+
+// tryScenario takes a scenario that is not configured here — the one being
+// written — and either checks it (dry_run=true) or walks it through once in
+// the background. Both build it exactly as a pushed one would be built.
+func (s *api) tryScenario(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorBody{"use POST"})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxConfigBody))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{err.Error()})
+		return
+	}
+	pc, err := config.ParseScenario(body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{err.Error()})
+		return
+	}
+	if r.URL.Query().Get("dry_run") == "true" {
+		t, err := s.app.ValidateScenario(pc)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, errorBody{err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, t)
+		return
+	}
+	t, err := s.app.TryScenario(pc)
+	switch {
+	case errors.Is(err, app.ErrTrialsBusy):
+		writeJSON(w, http.StatusConflict, errorBody{err.Error()})
+		return
+	case errors.Is(err, app.ErrNotRunning):
+		writeJSON(w, http.StatusServiceUnavailable, errorBody{err.Error()})
+		return
+	case err != nil:
+		writeJSON(w, http.StatusBadRequest, errorBody{err.Error()})
+		return
+	}
+	// A trial changes things on the target, as a scheduled run does.
+	s.app.Log.Info("scenario trial via api", "scenario", pc.Name, "trial", t.ID, "from", clientOf(r))
+	w.Header().Set("Location", "/api/scenario-trials/"+t.ID)
+	writeJSON(w, http.StatusAccepted, t)
+}
+
+// trial reports a trial: running, or how it went against each target.
+func (s *api) trial(w http.ResponseWriter, r *http.Request) {
+	t, err := s.app.TrialStatus(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, errorBody{err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, t)
 }
 
 type errorBody struct {

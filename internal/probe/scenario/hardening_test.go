@@ -544,3 +544,33 @@ steps:
 		t.Errorf("paths = %v, want the Location as a browser reads it", got)
 	}
 }
+
+// A file written into the scenario is checked as a file on disk is: when the
+// scenario is built, not minutes into a run.
+func TestFileWrittenInIsCheckedWhenBuilt(t *testing.T) {
+	for name, tc := range map[string]struct{ files, want string }{
+		"unknown key":  {`{f: {filename: a.txt, txt: x}}`, "field txt not found"},
+		"bad base64":   {`{f: {filename: a.bin, base64: "%%%"}}`, "base64"},
+		"path as name": {`{f: {filename: ../a.txt, text: x}}`, "a name, not a path"},
+		"both":         {`{f: {filename: a.txt, text: x, base64: eA==}}`, "one of them"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := buildProbe(config.Probe{Name: "s"}, `{steps: [{name: up, post: /, multipart: {files: `+tc.files+`}}]}`)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("err = %v, want it to mention %q", err, tc.want)
+			}
+		})
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.bin"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err := buildProbe(config.Probe{Name: "s", Dir: dir},
+		`{steps: [{name: up, post: /, multipart: {files: {f: {path: a.bin, filename: shown.bin, content_type: video/mp4}}}}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f := p.sc.steps[0].req.files[0]; f.filename != "shown.bin" || f.contentType != "video/mp4" || f.path != filepath.Join(dir, "a.bin") {
+		t.Errorf("file = %+v", f)
+	}
+}

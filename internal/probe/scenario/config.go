@@ -1,6 +1,8 @@
 package scenario
 
 import (
+	"cmp"
+	"encoding/base64"
 	"fmt"
 	"maps"
 	"mime"
@@ -35,10 +37,14 @@ type Config struct {
 	CleanupTimeout config.Duration `yaml:"cleanup_timeout"`
 }
 
-// Secret names where a secret is read from: a file or an environment variable.
+// Secret names where a secret is read from: a file or an environment variable,
+// read on every run — or the value itself, for a scenario pushed in the check
+// document by whoever holds the node's write token. A value is masked like
+// the others, in reports and in GET /api/config for the read token.
 type Secret struct {
-	File string `yaml:"file"`
-	Env  string `yaml:"env"`
+	File  string `yaml:"file"`
+	Env   string `yaml:"env"`
+	Value string `yaml:"value"`
 }
 
 // Step is one request, the checks its answer must pass and the values taken
@@ -130,10 +136,62 @@ func (c *Codes) UnmarshalYAML(n *yaml.Node) error {
 	return nil
 }
 
-// Multipart is a multipart/form-data body: text fields and files from disk.
+// Multipart is a multipart/form-data body: text fields and files, from disk or
+// written into the scenario.
 type Multipart struct {
-	Fields map[string]string `yaml:"fields"`
-	Files  map[string]string `yaml:"files"`
+	Fields map[string]string  `yaml:"fields"`
+	Files  map[string]FileRef `yaml:"files"`
+}
+
+// FileRef is a file a multipart body sends: a path, as a scalar or as path:,
+// or the content itself — base64: for bytes, text: for text — under the
+// filename the service is told. Content written in suits a scenario pushed
+// through the API, which has no directory of fixtures beside it.
+type FileRef struct {
+	Path        string `yaml:"path"`
+	Filename    string `yaml:"filename"`
+	ContentType string `yaml:"content_type"`
+	Base64      string `yaml:"base64"`
+	Text        string `yaml:"text"`
+}
+
+// maxInlineFile bounds a file written into the scenario: it travels in the
+// check document, which has a limit of its own.
+const maxInlineFile = 4 << 20
+
+var fileRefKeys = map[string]bool{"path": true, "filename": true, "content_type": true, "base64": true, "text": true}
+
+func (f *FileRef) UnmarshalYAML(n *yaml.Node) error {
+	switch n.Kind {
+	case yaml.ScalarNode:
+		f.Path = n.Value
+		return nil
+	case yaml.MappingNode:
+		// Node.Decode does not enforce known fields: a typo would send nothing.
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			if k := n.Content[i]; !fileRefKeys[k.Value] {
+				return fmt.Errorf("line %d: field %s not found in a file", k.Line, k.Value)
+			}
+		}
+		type plain FileRef
+		return n.Decode((*plain)(f))
+	}
+	return fmt.Errorf("line %d: a file is a path or a mapping", n.Line)
+}
+
+// inline is the content written into the scenario, decoded.
+func (f FileRef) inline() ([]byte, bool, error) {
+	switch {
+	case f.Base64 != "":
+		data, err := base64.StdEncoding.DecodeString(strings.Join(strings.Fields(f.Base64), ""))
+		if err != nil {
+			return nil, true, fmt.Errorf("base64: %w", err)
+		}
+		return data, true, nil
+	case f.Text != "":
+		return []byte(f.Text), true, nil
+	}
+	return nil, false, nil
 }
 
 // Extract takes one value out of an answer, from exactly one place.
@@ -167,18 +225,56 @@ func (c *Config) anchor(dir string) {
 		sec.File = abs(sec.File)
 		c.Secrets[name] = sec
 	}
+	for _, steps := range [][]Step{c.Steps, c.Cleanup} {
+		for i := range steps {
+			if mp := steps[i].Multipart; mp != nil {
+				for field, ref := range mp.Files {
+					ref.Path = abs(ref.Path)
+					mp.Files[field] = ref
+				}
+			}
+		}
+	}
 	c.TLS.CACert, c.TLS.ClientCert, c.TLS.ClientKey = abs(c.TLS.CACert), abs(c.TLS.ClientCert), abs(c.TLS.ClientKey)
 	for _, steps := range [][]Step{c.Steps, c.Cleanup} {
 		for i := range steps {
 			st := &steps[i]
 			st.BodyFile = abs(st.BodyFile)
+		}
+	}
+}
+
+// relative is the first file the scenario names by a relative path. A
+// scenario pushed in the check document has no directory to take it from,
+// and the node's working directory is an accident of how it started.
+func (c *Config) relative() string {
+	// A reference is refused by compile, with its own reason.
+	rel := func(p string) bool { return p != "" && !filepath.IsAbs(p) && !refPattern.MatchString(p) }
+	for name, sec := range c.Secrets {
+		if rel(sec.File) {
+			return "secrets." + name + ".file: " + sec.File
+		}
+	}
+	for _, p := range []string{c.TLS.CACert, c.TLS.ClientCert, c.TLS.ClientKey} {
+		if rel(p) {
+			return "tls: " + p
+		}
+	}
+	for _, steps := range [][]Step{c.Steps, c.Cleanup} {
+		for _, st := range steps {
+			if rel(st.BodyFile) {
+				return "body_file: " + st.BodyFile
+			}
 			if st.Multipart != nil {
-				for field, p := range st.Multipart.Files {
-					st.Multipart.Files[field] = abs(p)
+				for field, ref := range st.Multipart.Files {
+					if rel(ref.Path) {
+						return "multipart.files." + field + ": " + ref.Path
+					}
 				}
 			}
 		}
 	}
+	return ""
 }
 
 // fits checks the scenario against the probe's timing: a wait longer than the
@@ -258,7 +354,11 @@ type pair struct {
 	value template
 }
 
-type filePart struct{ field, path, contentType string }
+// filePart is a file a multipart body sends: from disk at path, or data.
+type filePart struct {
+	field, path, filename, contentType string
+	data                               []byte
+}
 
 type extractor struct {
 	name     string
@@ -301,8 +401,14 @@ func compile(cfg Config) (*compiled, error) {
 		if !identifier.MatchString(name) {
 			return nil, fmt.Errorf("secrets: %q is not a name", name)
 		}
-		if (s.File == "") == (s.Env == "") {
-			return nil, fmt.Errorf("secrets.%s: set file or env, one of them", name)
+		set := 0
+		for _, v := range []string{s.File, s.Env, s.Value} {
+			if v != "" {
+				set++
+			}
+		}
+		if set != 1 {
+			return nil, fmt.Errorf("secrets.%s: set file, env or value, one of them", name)
 		}
 		defs.secrets[name] = true
 	}
@@ -537,11 +643,12 @@ func compileRequest(r Step, defs definitions) (request, error) {
 			return out, err
 		}
 		for _, field := range slices.Sorted(maps.Keys(r.Multipart.Files)) {
-			path := r.Multipart.Files[field]
-			if err := readable(path); err != nil {
+			part, err := compileFile(r.Multipart.Files[field])
+			if err != nil {
 				return out, fmt.Errorf("multipart.files.%s: %w", field, err)
 			}
-			out.files = append(out.files, filePart{field, path, contentType(path)})
+			part.field = field
+			out.files = append(out.files, part)
 		}
 	}
 	out.sensitive = out.sends(defs)
@@ -647,6 +754,43 @@ func checkURL(s string) (absolute bool, err error) {
 		return false, fmt.Errorf("%q is neither a path nor an http(s) URL", s)
 	}
 	return true, nil
+}
+
+// compileFile checks a multipart file when the scenario is built: one that is
+// missing, or content that does not decode, fails the configuration rather
+// than a run.
+func compileFile(ref FileRef) (filePart, error) {
+	data, inline, err := ref.inline()
+	if err != nil {
+		return filePart{}, err
+	}
+	if inline == (ref.Path != "") || ref.Base64 != "" && ref.Text != "" {
+		return filePart{}, fmt.Errorf("set path, base64 or text, one of them")
+	}
+	if !inline {
+		if err := readable(ref.Path); err != nil {
+			return filePart{}, err
+		}
+		return filePart{
+			path:        ref.Path,
+			filename:    cmp.Or(ref.Filename, filepath.Base(ref.Path)),
+			contentType: cmp.Or(ref.ContentType, contentType(ref.Path)),
+		}, nil
+	}
+	if len(data) > maxInlineFile {
+		return filePart{}, fmt.Errorf("%d bytes written into the scenario, at most %d: put a larger file on the node", len(data), maxInlineFile)
+	}
+	if ref.Filename == "" {
+		return filePart{}, fmt.Errorf("filename: the service is told a name for content written in")
+	}
+	if strings.ContainsAny(ref.Filename, "/\\\r\n") {
+		return filePart{}, fmt.Errorf("filename %q: a name, not a path", ref.Filename)
+	}
+	return filePart{
+		filename:    ref.Filename,
+		contentType: cmp.Or(ref.ContentType, contentType(ref.Filename)),
+		data:        data,
+	}, nil
 }
 
 // readable checks a file the scenario sends when it is built, not minutes into

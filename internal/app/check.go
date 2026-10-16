@@ -243,6 +243,8 @@ func (a *App) capturePolicy() (*probe.Capture, error) {
 		return nil, fmt.Errorf("capture is off on this node (http.api.capture)")
 	case config.CaptureAll:
 		return &probe.Capture{}, nil
+	case config.CapturePrivate:
+		return &probe.Capture{Allow: probe.Internal}, nil
 	default:
 		return &probe.Capture{Allow: probe.Public}, nil
 	}

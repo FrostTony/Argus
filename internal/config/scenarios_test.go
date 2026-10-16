@@ -151,3 +151,42 @@ func TestScenarioPathsAreTakenFromTheServerFile(t *testing.T) {
 		t.Errorf("paths = %v, want %v", cfg.Scenarios.Paths, want)
 	}
 }
+
+// A check file may carry scenarios too; their files are beside it, as a
+// scenario file's are beside the scenario.
+func TestDocumentScenariosInACheckFile(t *testing.T) {
+	dir := t.TempDir()
+	path := write(t, dir, "checks.yaml", `
+probes:
+  - {name: web, type: http, targets: ["https://example.com"]}
+scenarios:
+  - name: upload
+    interval: 1h
+    timeout: 1m
+    targets: ["https://example.com"]
+    steps: [{name: put, post: /, body_file: fixtures/a.bin}]
+`)
+	f, err := LoadFiles(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Probes.Inline) != 1 || f.Probes.Inline[0].Dir != dir || f.Probes.Inline[0].Type != ScenarioType {
+		t.Fatalf("inline = %+v", f.Probes.Inline)
+	}
+	list, err := f.Probes.Resolve()
+	if err != nil || len(list) != 2 {
+		t.Fatalf("resolve = %v, %v", list, err)
+	}
+
+	clash := `
+probes: [{name: x, type: http, targets: ["https://example.com"]}]
+scenarios: [{name: x, interval: 1h, timeout: 1m, targets: ["https://example.com"], steps: [{name: a, get: /}]}]
+`
+	p, err := ParseProbes([]byte(clash))
+	if err == nil || !strings.Contains(err.Error(), "already used by probes[0]") {
+		t.Errorf("a scenario named as a probe: %v, %v", p.Inline, err)
+	}
+	if _, err := ParseProbes([]byte("scenarios: {name: x}\n")); err == nil || !strings.Contains(err.Error(), "is a list") {
+		t.Errorf("scenarios as a mapping: %v", err)
+	}
+}

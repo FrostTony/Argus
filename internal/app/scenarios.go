@@ -13,9 +13,9 @@ import (
 // ErrNotFound says nothing of that name runs on this node.
 var ErrNotFound = errors.New("not found")
 
-// errNotRunning refuses a background run before Start or after shutdown, when
+// ErrNotRunning refuses a background run before Start or after shutdown, when
 // nothing would wait for it.
-var errNotRunning = errors.New("the node is not running")
+var ErrNotRunning = errors.New("the node is not running")
 
 // ScenarioStatus is a scenario as the API describes it: what it does and how
 // its last run against each target went.
@@ -99,7 +99,7 @@ func (a *App) RunScenario(name string) error {
 	a.mu.Lock()
 	if a.rootCtx == nil || a.stopped {
 		a.mu.Unlock()
-		return errNotRunning
+		return ErrNotRunning
 	}
 	root := a.rootCtx
 	// Registered under mu, where Start sets stopped: shutdown waits for it.

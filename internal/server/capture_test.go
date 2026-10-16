@@ -28,9 +28,10 @@ func TestCaptureModes(t *testing.T) {
 	spec := "name: page\ntype: http\ntargets: [\"" + url + "/\"]\nhttp: {}\n"
 
 	for mode, want := range map[string]string{
-		config.CapturePublic: "capture does not reach 127.0.0.1",
-		config.CaptureAll:    "PGgxPmludGVybmFsIGFkbWluPC9oMT4=", // the page
-		config.CaptureOff:    "capture is off on this node",
+		config.CapturePublic:  "capture does not reach 127.0.0.1",
+		config.CapturePrivate: "capture does not reach 127.0.0.1", // loopback is the node's own
+		config.CaptureAll:     "PGgxPmludGVybmFsIGFkbWluPC9oMT4=", // the page
+		config.CaptureOff:     "capture is off on this node",
 	} {
 		ts := serve(t, newAppWith(t, func(c *config.Server) { c.HTTP.API.Capture = mode }), nil)
 		code, out := do(t, ts, http.MethodPost, "/api/check?capture=true", "tok", spec)

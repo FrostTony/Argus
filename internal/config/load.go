@@ -79,6 +79,10 @@ func LoadFiles(paths ...string) (Files, error) {
 		if err := decodeDocument(data, &p); err != nil {
 			return out, fmt.Errorf("%s: %w", f, err)
 		}
+		// Files a scenario in the document names are beside the document.
+		if err := p.Inline.anchor(f); err != nil {
+			return out, err
+		}
 		if err := out.Probes.absorb(p, f); err != nil {
 			return out, err
 		}
@@ -118,6 +122,7 @@ func (p *Probes) absorb(other Probes, src string) error {
 		p.Templates[name] = tpl
 	}
 	p.List = append(p.List, other.List...)
+	p.Inline = append(p.Inline, other.Inline...)
 	return nil
 }
 

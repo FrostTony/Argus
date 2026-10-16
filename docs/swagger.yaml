@@ -53,8 +53,10 @@ tags:
   - name: scenarios
     description: |
       Multi-step checks that act on a service the way a user does, read from
-      the files under `scenarios.paths`. Each changes the target and runs for
-      minutes, so none runs inside a request.
+      the files under `scenarios.paths` or pushed under `scenarios:` of the
+      check document. Each changes the target and runs for minutes, so none
+      runs inside a request; a trial of one not yet configured runs in the
+      background.
 
 paths:
   /metrics:
@@ -675,6 +677,47 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/Error"}
 
+  /api/scenario-trials:
+    post:
+      tags: [scenarios]
+      summary: Check a scenario, or walk it through once
+      description: |
+        The body is one scenario as an item of the check document's
+        `scenarios:` is written, `name` included. It is built exactly as a
+        pushed one would be. With `dry_run=true` nothing runs: the answer is
+        what would run, or 400 with what is wrong. Without it the scenario runs
+        once in the background — against the target, changing it as a scheduled
+        run would — and the answer is 202 with the trial's id. A trial writes
+        no metrics and is not configured; its report is kept for 30 minutes.
+        Two trials run at a time; a third is 409.
+      security: [{writeToken: []}]
+      parameters:
+        - name: dry_run
+          in: query
+          required: false
+          schema: {type: boolean, default: false}
+      requestBody:
+        required: true
+        content:
+          application/yaml:
+            schema: {type: string}
+      responses:
+        "200": {description: Built; nothing ran., content: {application/json: {schema: {$ref: "#/components/schemas/ScenarioTrial"}}}}
+        "202": {description: Started., content: {application/json: {schema: {$ref: "#/components/schemas/ScenarioTrial"}}}}
+        "400": {$ref: "#/components/responses/BadRequest"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "409": {description: Two trials are already running.}
+  /api/scenario-trials/{id}:
+    get:
+      tags: [scenarios]
+      summary: How a trial went
+      security: [{readToken: []}]
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        "200": {description: The trial., content: {application/json: {schema: {$ref: "#/components/schemas/ScenarioTrial"}}}}
+        "404": {description: No such trial, or its report is gone.}
+
 components:
   securitySchemes:
     readToken:
@@ -745,8 +788,9 @@ components:
         link-local (where cloud metadata lives), private, carrier-grade NAT or
         reserved space. The address is vetted on every connection, after
         resolution, so a redirect, a proxy or a name that resolves elsewhere
-        the second time cannot carry the capture inward. `all` lifts that;
-        `off` refuses capture with 400.
+        the second time cannot carry the capture inward. `private` adds
+        private and carrier-grade NAT networks and still refuses loopback and
+        link-local; `all` lifts every limit; `off` refuses capture with 400.
 
         A body stops at `max_body_bytes` or 2 MiB, whichever is less, and the
         exchange at 64 KiB; `truncated` says so. The answer is compact JSON.
@@ -996,6 +1040,23 @@ components:
           items: {$ref: "#/components/schemas/Artifact"}
           description: What this backend answered, with `capture=true`.
       required: [success]
+
+    ScenarioTrial:
+      type: object
+      properties:
+        id: {type: string, description: Empty for a dry run.}
+        scenario: {type: string}
+        started: {type: string, format: date-time}
+        finished: {type: string, format: date-time}
+        running: {type: boolean}
+        steps: {type: array, items: {type: string}}
+        cleanup: {type: array, items: {type: string}}
+        targets: {type: array, items: {type: string}}
+        reports:
+          type: array
+          description: One per target, as `last_runs` of a configured scenario.
+          items: {type: object, additionalProperties: true}
+        error: {type: string}
 
     Artifact:
       type: object

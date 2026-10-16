@@ -68,6 +68,12 @@ func New(pc config.Probe) (probe.Prober, error) {
 	if err := pc.DecodeOptions(&cfg); err != nil {
 		return nil, err
 	}
+	if pc.Dir == "" {
+		if rel := cfg.relative(); rel != "" {
+			return nil, fmt.Errorf("%s: a scenario sent in the check document has no directory of its own; "+
+				"name the file by an absolute path, or write the content in", rel)
+		}
+	}
 	cfg.anchor(pc.Dir)
 	sc, err := compile(cfg)
 	if err != nil {
@@ -274,6 +280,9 @@ func (c *compiled) scope() (*scope, error) {
 }
 
 func (s Secret) read() (string, error) {
+	if s.Value != "" {
+		return s.Value, nil
+	}
 	if s.Env != "" {
 		v, ok := os.LookupEnv(s.Env)
 		if !ok || v == "" {

@@ -54,8 +54,9 @@ type API struct {
 	ReadAuth  string `yaml:"read_auth"`
 	WriteAuth string `yaml:"write_auth"`
 	// Capture decides what /api/check?capture=true may read: off, public
-	// addresses only, or all. Public by default — a capture that reaches
-	// loopback or link-local hands out the node's own network, cloud
+	// addresses only, private — public and private networks, never the node's
+	// own loopback or link-local — or all. Public by default — a capture that
+	// reaches loopback or link-local hands out the node's own network, cloud
 	// metadata credentials included.
 	Capture string `yaml:"capture"`
 }
@@ -64,9 +65,10 @@ const (
 	AuthToken = "token"
 	AuthNone  = "none"
 
-	CaptureOff    = "off"
-	CapturePublic = "public"
-	CaptureAll    = "all"
+	CaptureOff     = "off"
+	CapturePublic  = "public"
+	CapturePrivate = "private"
+	CaptureAll     = "all"
 )
 
 // ReadTokens lists the tokens that authorise a read.
@@ -210,7 +212,7 @@ func DefaultServer() Server {
 
 var (
 	validAuth    = map[string]bool{AuthToken: true, AuthNone: true}
-	validCapture = map[string]bool{CaptureOff: true, CapturePublic: true, CaptureAll: true}
+	validCapture = map[string]bool{CaptureOff: true, CapturePublic: true, CapturePrivate: true, CaptureAll: true}
 )
 
 func (a API) validate() error {
@@ -230,7 +232,7 @@ func (a API) validate() error {
 		}
 	}
 	if !validCapture[a.Capture] {
-		return fmt.Errorf("http.api.capture: want off|public|all, got %q", a.Capture)
+		return fmt.Errorf("http.api.capture: want off|public|private|all, got %q", a.Capture)
 	}
 	if a.WriteAuth == AuthToken && a.Token == "" {
 		return fmt.Errorf("http.api.write_auth=token requires http.api.token")

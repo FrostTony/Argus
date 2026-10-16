@@ -11,7 +11,6 @@ import (
 	"net/textproto"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"golang.org/x/net/http/httpguts"
@@ -233,12 +232,17 @@ func (r *request) multipart(s *scope) (payload, error) {
 	for _, f := range r.files {
 		h := textproto.MIMEHeader{}
 		h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`,
-			quote(f.field), quote(filepath.Base(f.path))))
+			quote(f.field), quote(f.filename)))
 		h.Set("Content-Type", f.contentType)
 		if _, err := mw.CreatePart(h); err != nil {
 			return fail(err)
 		}
 		cut()
+		if f.path == "" {
+			parts = append(parts, bytes.NewReader(f.data))
+			p.size += int64(len(f.data))
+			continue
+		}
 		file, size, err := open(f.path)
 		if err != nil {
 			return fail(fmt.Errorf("multipart.files.%s: %w", f.field, err))

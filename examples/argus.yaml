@@ -38,8 +38,9 @@ http:
     # probe_aliases: false
     # /api/check?capture=true returns what the target answered. public reads
     # only public addresses — never loopback, link-local (cloud metadata),
-    # private or reserved ranges, a proxy on one included; all reads anything;
-    # off turns capture away.
+    # private or reserved ranges, a proxy on one included; private adds
+    # private and CGNAT networks, never loopback or link-local; all reads
+    # anything; off turns capture away.
     # capture: public
   # tls:
   #   cert_file: /etc/argus/tls/server.crt

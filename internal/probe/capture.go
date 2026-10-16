@@ -52,7 +52,22 @@ func (c *Capture) control() func(string, string, syscall.RawConn) error {
 	if c.Allow == nil {
 		return nil
 	}
-	return Control(c.Allow, "capture does not reach %s: not a public address (http.api.capture: all allows it)")
+	return Control(c.Allow, "capture does not reach %s: the node's http.api.capture does not admit it")
+}
+
+// Internal is Public plus the networks a node inside a company checks its
+// services on — private (RFC 1918, fc00::/7) and carrier-grade NAT space —
+// and still never loopback, link-local (cloud metadata), unspecified,
+// multicast or reserved space: those are the node's own, not a service's.
+func Internal(a netip.Addr) bool {
+	if Public(a) {
+		return true
+	}
+	a = a.Unmap()
+	if nat64.Contains(a) {
+		a = netip.AddrFrom4([4]byte(a.AsSlice()[12:]))
+	}
+	return a.IsGlobalUnicast() && (a.IsPrivate() || cgnat.Contains(a))
 }
 
 // Public reports whether the internet at large reaches an address — what a
@@ -76,6 +91,7 @@ func Public(a netip.Addr) bool {
 }
 
 var (
+	cgnat    = netip.MustParsePrefix("100.64.0.0/10")
 	nat64    = netip.MustParsePrefix("64:ff9b::/96")
 	reserved = []netip.Prefix{
 		netip.MustParsePrefix("0.0.0.0/8"),     // "this network": 0.x reaches the node itself

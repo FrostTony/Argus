@@ -53,7 +53,12 @@ func redactNode(n *yaml.Node, secret bool) {
 		}
 	case yaml.MappingNode:
 		for i := 0; i+1 < len(n.Content); i += 2 {
-			redactNode(n.Content[i+1], secret || secretKey.MatchString(n.Content[i].Value))
+			key, value := n.Content[i].Value, n.Content[i+1]
+			if key == "secrets" && value.Kind == yaml.MappingNode && !secret {
+				redactSecrets(value)
+				continue
+			}
+			redactNode(value, secret || secretKey.MatchString(key))
 		}
 	default:
 		for _, c := range n.Content {
@@ -62,8 +67,28 @@ func redactNode(n *yaml.Node, secret bool) {
 	}
 }
 
+// redactSecrets masks a scenario's secrets written in as values. Where the
+// others are read from — a file, a variable — names a secret without being one.
+func redactSecrets(n *yaml.Node) {
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		def := n.Content[i+1]
+		if def.Kind != yaml.MappingNode {
+			redactNode(def, true)
+			continue
+		}
+		for j := 0; j+1 < len(def.Content); j += 2 {
+			redactNode(def.Content[j+1], def.Content[j].Value == "value")
+		}
+	}
+}
+
+// scenarioRef is a scenario's own reference — ${secret.password} names the
+// secret, it is not one.
+var scenarioRef = regexp.MustCompile(`\$\{(var|secret|run)\.[A-Za-z0-9_]+\}`)
+
 func onlyReferences(v string) bool {
-	return strings.TrimSpace(envRef.ReplaceAllString(v, "")) == "" && v != ""
+	rest := scenarioRef.ReplaceAllString(envRef.ReplaceAllString(v, ""), "")
+	return strings.TrimSpace(rest) == "" && v != ""
 }
 
 // RedactURL masks the password of a URL and returns anything else unchanged:

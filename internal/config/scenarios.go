@@ -168,3 +168,74 @@ func (p Probe) validateScenario() error {
 	}
 	return nil
 }
+
+// DocumentScenarios are the scenarios a check document carries under
+// scenarios:, each the mapping a scenario file holds plus the name a file
+// takes from its own name.
+type DocumentScenarios []Probe
+
+func (d *DocumentScenarios) UnmarshalYAML(n *yaml.Node) error {
+	n, err := resolved(n)
+	if err != nil {
+		return err
+	}
+	if n.Kind != yaml.SequenceNode {
+		return fmt.Errorf("line %d: scenarios is a list, one scenario per item", n.Line)
+	}
+	out := make(DocumentScenarios, 0, len(n.Content))
+	seen := make(map[string]int, len(n.Content))
+	for i, item := range n.Content {
+		var f scenarioFile
+		if err := f.UnmarshalYAML(item); err != nil {
+			return fmt.Errorf("scenarios[%d]: %w", i, err)
+		}
+		p := f.probe
+		if p.Name == "" {
+			return fmt.Errorf("scenarios[%d]: name is missing", i)
+		}
+		if prev, dup := seen[p.Name]; dup {
+			return fmt.Errorf("scenarios[%d]: scenario %q is already defined by scenarios[%d]", i, p.Name, prev)
+		}
+		seen[p.Name] = i
+		if err := p.validateScenario(); err != nil {
+			return fmt.Errorf("scenarios[%d]: %w", i, err)
+		}
+		out = append(out, p)
+	}
+	*d = out
+	return nil
+}
+
+// anchor places the scenarios of a document read from a file beside it, as a
+// scenario file's own are. A document pushed through the API has no
+// directory, and its scenarios name files by absolute path or not at all.
+func (d DocumentScenarios) anchor(file string) error {
+	if len(d) == 0 {
+		return nil
+	}
+	dir, err := filepath.Abs(filepath.Dir(file))
+	if err != nil {
+		return fmt.Errorf("scenarios: %w", err)
+	}
+	for i := range d {
+		d[i].Dir = dir
+	}
+	return nil
+}
+
+// ParseScenario reads one scenario as a document carries it, for the API that
+// validates or tries a scenario before it is pushed.
+func ParseScenario(data []byte) (Probe, error) {
+	var f scenarioFile
+	if err := decodeDocument(data, &f); err != nil {
+		return Probe{}, err
+	}
+	p := f.probe
+	if p.Type == "" {
+		return p, fmt.Errorf("the scenario is empty")
+	}
+	if p.Name == "" {
+		return p, fmt.Errorf("name is missing")
+	}
+	return p, p.validateScenario()
+}

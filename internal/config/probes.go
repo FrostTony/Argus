@@ -27,10 +27,15 @@ type Probes struct {
 	Defaults  Probe            `yaml:"defaults"`
 	Templates map[string]Probe `yaml:"templates"`
 	List      []Probe          `yaml:"probes"`
-	// Scenarios come from files of their own (see LoadScenarios), never from
-	// this document. They take nothing from Defaults: a default made for
-	// one-request checks would quietly cut a minutes-long scenario short.
+	// Scenarios come from files of their own (see LoadScenarios). They take
+	// nothing from Defaults: a default made for one-request checks would
+	// quietly cut a minutes-long scenario short.
 	Scenarios []Probe `yaml:"-"`
+	// Inline are the scenarios written in this document, under scenarios:. A
+	// node managed through the API has nowhere else to be given one: the
+	// document it is pushed is all it hears. They take nothing from Defaults
+	// either, and are replaced with the document, while Scenarios stay.
+	Inline DocumentScenarios `yaml:"scenarios,omitempty"`
 }
 
 // Probe holds the prober's own parameters under a key named after its type
@@ -340,8 +345,8 @@ func (p *Probes) Resolve() ([]Probe, error) {
 		case "":
 			return nil, fmt.Errorf("probes[%d] (%s): probe type is missing", i, probe.Name)
 		case ScenarioType:
-			return nil, fmt.Errorf("probes[%d] (%s): a scenario is a file of its own, "+
-				"in a directory listed under scenarios.paths in argus.yaml", i, probe.Name)
+			return nil, fmt.Errorf("probes[%d] (%s): a scenario goes under scenarios: in this document, "+
+				"or in a file of its own under scenarios.paths in argus.yaml", i, probe.Name)
 		}
 		if merged.Targets.Empty() {
 			return nil, fmt.Errorf("probes[%d] (%s): targets are missing", i, probe.Name)
@@ -351,9 +356,22 @@ func (p *Probes) Resolve() ([]Probe, error) {
 		}
 		out = append(out, merged)
 	}
+	files := make(map[string]bool, len(p.Scenarios))
 	for _, sc := range p.Scenarios {
 		if prev, dup := seen[sc.Name]; dup {
 			return nil, fmt.Errorf("scenario %q: the name is already used by probes[%d]", sc.Name, prev)
+		}
+		files[sc.Name] = true
+		out = append(out, sc)
+	}
+	for i, sc := range p.Inline {
+		if prev, dup := seen[sc.Name]; dup {
+			return nil, fmt.Errorf("scenarios[%d] (%s): the name is already used by probes[%d]", i, sc.Name, prev)
+		}
+		// A file and the document naming the same scenario would leave which
+		// one runs to the order they were read in.
+		if files[sc.Name] {
+			return nil, fmt.Errorf("scenarios[%d] (%s): a scenario file of that name is already on the node", i, sc.Name)
 		}
 		out = append(out, sc)
 	}

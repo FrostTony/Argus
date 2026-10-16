@@ -37,8 +37,10 @@ type App struct {
 	// sem caps the scheduled runs' backend requests; adhoc caps the
 	// on-demand ones apart, so that callers of /probe and /api/check, read
 	// tokens included, cannot take the slots monitoring runs on.
-	sem       chan struct{}
-	adhoc     chan struct{}
+	sem   chan struct{}
+	adhoc chan struct{}
+	// trials are runs of scenarios not configured here, see TryScenario.
+	trials    trials
 	buckets   metrics.Buckets
 	closers   []func() error
 	reopeners []func() error

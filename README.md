@@ -286,7 +286,7 @@ taken from it:
 |---|---|
 | `get` / `post` / `put` / `patch` / `delete` / `head` / `options` | the request, by its method: a path is taken against the target, a URL goes anywhere — a presigned upload address an earlier step was handed |
 | `query`, `headers` | values are encoded for you |
-| `body` / `body_file` / `json` / `form` / `multipart` | at most one; files are streamed from disk with their length announced, and named relative to the scenario's file |
+| `body` / `body_file` / `json` / `form` / `multipart` | at most one; files are streamed from disk with their length announced, and named relative to the scenario's file. A multipart file may be written in instead: `{filename: report.csv, text: "..."}` or `{filename: a.mp4, base64: ...}`, up to 4 MiB |
 | `follow_redirects`, `max_body_bytes`, `timeout` | per step |
 | `status` | `201`, `2xx`, `"200-299"` or a list of them; `200-399` unless this or an `expect` says otherwise |
 | `expect` | the same validators as `http` (`body_regex`, `header_regex`, `json_path`+`json_equals`, size bounds, …) |
@@ -306,7 +306,7 @@ host too. A Location extracted from an answer is taken against the request
 that got it, as a browser reads it.
 
 **Secrets** come from `file:` or `env:`, are read on every run so a rotation
-needs no reload, and are replaced by their reference in every error and report,
+needs no reload — or from `value:`, written in by whoever pushes the document, and are replaced by their reference in every error and report,
 in every form it takes on the way out and back — escaped for a path, a query
 or JSON, HTML-escaped, `\/`, lowercase `%xx`. Checks and extracts read the
 answer as it came; only what is shown is masked. An extracted value marked
@@ -339,6 +339,32 @@ runs inside a request: `/probe` and `/api/check` refuse it, and `POST
 /api/scenarios/NAME/run` starts one off its schedule and answers at once; `GET
 /api/scenarios/NAME` shows how its last run against each target went, step by
 step. `argus oneshot -probe NAME` runs it from the command line.
+
+**Pushed with the checks.** A node run from the API has no directory anyone
+writes scenarios into, so the check document carries them too, under
+`scenarios:` — each one the mapping a file would hold, with its `name`:
+
+```yaml
+probes: [...]
+scenarios:
+  - name: shop-checkout
+    interval: 15m
+    timeout: 5m
+    targets: [https://shop.example/]
+    secrets: {password: {value: "..."}}   # masked for the read token
+    steps: [...]
+```
+
+They are replaced with the document, as its probes are, while the node's own
+scenario files stay; a name both use is refused. Such a scenario has no
+directory: a file it sends is named by an absolute path or written in.
+
+**Trying one.** `POST /api/scenario-trials` takes one scenario, as an item of
+`scenarios:` is written, and walks it through once in the background without
+configuring it — no schedule, no metrics — answering 202 with the trial's id;
+`GET /api/scenario-trials/ID` gives its report step by step, kept for 30
+minutes. `?dry_run=true` builds it and runs nothing: every reference, file and
+validator checked as a push would check them. Two trials run at a time.
 
 Each step's duration is a phase — `probe_phase_last_duration_seconds{phase="convert"}`
 is the conversion time — and `probe_success`, `probe_up` and
@@ -606,8 +632,10 @@ probe with several targets needs `target=`. A scheduled run never captures.
 What a capture may read is `http.api.capture`. The default, `public`, never
 connects to loopback, link-local (cloud metadata), private, CGNAT or reserved
 addresses; the check runs on each connection after resolution, so neither a
-redirect nor a proxy nor DNS rebinding carries it inward. `all` lifts that,
-for nodes that capture internal services; `off` refuses capture. A body stops
+redirect nor a proxy nor DNS rebinding carries it inward. `private` adds
+private and CGNAT networks — a node inside a company captures its services —
+and still never loopback or link-local, where the node's own secrets and cloud
+metadata live. `all` lifts every limit; `off` refuses capture. A body stops
 at `max_body_bytes` or 2 MiB, the exchange at 64 KiB.
 
 `/probe` carries no histograms. One run is not a distribution — a histogram
