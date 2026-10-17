@@ -164,7 +164,7 @@ itself.
 
 | Type | Checks | Notable options |
 |---|---|---|
-| `http` | status, body, headers, JSON fields, redirect chain, certificate | `method`, `headers`, `body`, `auth`, `follow_redirects`, `redirect_to_private`, `read_body`, `http2`, `compression`, `proxy_url`, `proxy_from_environment`, `no_proxy`, `validators` |
+| `http` | status, body, headers, JSON fields, redirect chain, certificate | `method`, `headers`, `body`, `auth`, `follow_redirects`, `cookies`, `redirect_to_private`, `read_body`, `http2`, `compression`, `proxy_url`, `proxy_from_environment`, `no_proxy`, `validators` |
 | `dns` | answers, rcode, authority and additional sections, drift between resolvers | `servers`, `proto` (`udp`/`tcp`/`tls`/`https`), `query_type`, `min_answers`, `expect`, `valid_rcodes`, `require_authoritative`, `compare_servers` |
 | `tls` | the certificate on the connection, apart from any request | `port`, `min_days_left` |
 | `tcp` | the port, or a scripted conversation over it | `port`, `steps` (`send`/`expect`/`starttls`), `tls` |
@@ -205,6 +205,11 @@ A target on a public address cannot redirect an `http` check to a private one
 otherwise point the node inward. A target that is itself private redirects
 where it likes, and `redirect_to_private: true` lifts the rule for a public
 one. With a proxy, the proxy decides.
+
+Within one run an `http` check keeps the cookies its responses set, as a
+browser does: a site that sets a cookie and redirects to itself — consent, a
+geo choice, a bot check — would otherwise loop to the redirect limit. Nothing
+outlives the run; `cookies: false` sends every hop bare.
 
 [examples/probes.d/example.yaml](examples/probes.d/example.yaml) is a working
 file with every option demonstrated and commented.

@@ -24,6 +24,8 @@ templates:
     http:
       method: GET
       follow_redirects: true
+      # cookies set along the redirect chain go with its next hops (the default)
+      cookies: true
       validators:
         - name: status
           status_code: ["200-399"]

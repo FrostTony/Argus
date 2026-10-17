@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptrace"
 	"net/url"
 	"os"
@@ -23,6 +24,7 @@ import (
 
 	"golang.org/x/net/http/httpproxy"
 	"golang.org/x/net/idna"
+	"golang.org/x/net/publicsuffix"
 
 	"github.com/tonyamdfrost-cmd/Argus/internal/config"
 	"github.com/tonyamdfrost-cmd/Argus/internal/metrics"
@@ -55,6 +57,11 @@ type Config struct {
 
 	FollowRedirects *bool `yaml:"follow_redirects"`
 	MaxRedirects    int   `yaml:"max_redirects"`
+	// Cookies keeps what the responses of one run set, for the rest of its
+	// redirects, as a browser does: a site that sets a cookie and redirects to
+	// itself (consent, geo, a bot check) otherwise loops to the redirect limit.
+	// Nothing outlives the run. On by default; false sends every hop bare.
+	Cookies *bool `yaml:"cookies"`
 
 	ReadBody     *bool `yaml:"read_body"`
 	MaxBodyBytes int64 `yaml:"max_body_bytes"`
@@ -79,6 +86,7 @@ type Config struct {
 type Prober struct {
 	cfg      Config
 	follow   bool
+	cookies  bool
 	readBody bool
 	keepBody bool
 	maxBody  int64
@@ -101,6 +109,7 @@ func New(pc config.Probe) (probe.Prober, error) {
 	p := &Prober{
 		cfg:      cfg,
 		follow:   cfg.FollowRedirects == nil || *cfg.FollowRedirects,
+		cookies:  cfg.Cookies == nil || *cfg.Cookies,
 		readBody: cfg.ReadBody == nil || *cfg.ReadBody,
 		maxBody:  cfg.MaxBodyBytes,
 	}
@@ -244,6 +253,12 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
+		// A redirect refused on the way (the limit, another host) still came with
+		// the hops before it: the chain is what explains the failure - a loop shows
+		// itself as the same address twice.
+		if resp != nil && req.Capture != nil {
+			res.Artifacts = chainArtifacts(resp)
+		}
 		res.Err = probe.Wrap(classify(t), err)
 		p.phases(&res, t, time.Time{})
 		return res
@@ -330,6 +345,10 @@ func (p *Prober) client(req probe.Request, u *url.URL) (*http.Client, *probe.Con
 		}
 	}
 	c := &http.Client{Transport: tr}
+	if p.cookies && p.follow {
+		// A jar per run: what one check was told never reaches the next.
+		c.Jar, _ = cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	}
 	if !p.follow {
 		c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	} else {

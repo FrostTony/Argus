@@ -35,6 +35,14 @@ func artifacts(resp *http.Response, body []byte, size int64) []probe.Artifact {
 	}
 }
 
+// chainArtifacts is the exchange alone, for a chain that stopped before an
+// answer: the last response's body is already closed, and was a redirect's.
+func chainArtifacts(resp *http.Response) []probe.Artifact {
+	headers, cut := exchange(resp)
+	return []probe.Artifact{{Name: "headers", MediaType: "text/plain; charset=utf-8",
+		URL: resp.Request.URL.Redacted(), Data: headers, Truncated: cut}}
+}
+
 // exchange writes every hop, redirects first: a block page is often a redirect
 // away from the URL asked for. Request headers stay out and URLs are redacted —
 // both carry the probe's credentials.
