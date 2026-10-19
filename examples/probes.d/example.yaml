@@ -322,6 +322,23 @@ probes:
           from: "09:00"
           to: "19:00"
 
+  # A target that is paid for by the call. cron runs it at the minutes it names
+  # on every node alike — no jitter, no run at start — so a month is a count
+  # known in advance: 10 hours x 22 weekdays = 220. quota is the ceiling that
+  # holds whatever else asks: /api/check and /probe draw on it too, and a run
+  # that would not fit is not started. `argus cron -tz Europe/Moscow
+  # "0 9-18 * * mon-fri"` lists the runs.
+  - name: example_paid_api
+    template: web
+    disabled: true
+    cron: "0 9-18 * * mon-fri"
+    timezone: Europe/Moscow
+    quota: {requests: 250, per: month}
+    per_backend: false
+    labels: {project: demo}
+    targets:
+      - https://api.example.com/v1/status
+
   # Three attempts per run: one lost packet is not an outage, and this is the
   # difference between a flapping alert and a real one.
   - name: example_retried

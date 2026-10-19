@@ -41,7 +41,11 @@ var weekdays = map[string]time.Weekday{
 }
 
 // Compile validates the schedule; a nil schedule compiles to nil, always active.
-func (s *Schedule) Compile() (*Compiled, error) {
+func (s *Schedule) Compile() (*Compiled, error) { return s.CompileIn(nil) }
+
+// CompileIn is Compile with the time zone the schedule falls back to when it
+// names none of its own: the probe's. Nil is the node's local time.
+func (s *Schedule) CompileIn(fallback *time.Location) (*Compiled, error) {
 	if s == nil {
 		return nil, nil
 	}
@@ -49,7 +53,7 @@ func (s *Schedule) Compile() (*Compiled, error) {
 		return nil, fmt.Errorf("schedule needs at least one window")
 	}
 
-	out := &Compiled{loc: time.Local}
+	out := &Compiled{loc: cmp.Or(fallback, time.Local)}
 	if s.Timezone != "" {
 		loc, err := time.LoadLocation(s.Timezone)
 		if err != nil {

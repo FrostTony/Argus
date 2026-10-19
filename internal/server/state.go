@@ -26,12 +26,16 @@ type stateView struct {
 }
 
 type probeData struct {
-	Name     string       `json:"name"`
-	Type     string       `json:"type"`
-	Interval string       `json:"interval"`
-	Sleeping bool         `json:"sleeping,omitempty"`
-	Negative bool         `json:"negative,omitempty"`
-	Targets  []targetData `json:"targets"`
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Interval string `json:"interval"`
+	Sleeping bool   `json:"sleeping,omitempty"`
+	Negative bool   `json:"negative,omitempty"`
+	Cron     string `json:"cron,omitempty"`
+	NextRun  string `json:"next_run,omitempty"`
+	// Quota is the probe's count this period; it pauses the probe when spent.
+	Quota   *app.QuotaStatus `json:"quota,omitempty"`
+	Targets []targetData     `json:"targets"`
 }
 
 type targetData struct {
@@ -180,6 +184,7 @@ func (s *statusPage) state() stateView {
 		byProbe[p.Name] = &probeData{
 			Name: p.Name, Type: p.Type, Interval: p.Interval,
 			Sleeping: p.Sleeping, Negative: p.Negative,
+			Cron: p.Cron, NextRun: p.NextRun, Quota: p.Quota,
 			Targets: []targetData{},
 		}
 	}

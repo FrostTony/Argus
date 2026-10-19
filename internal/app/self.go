@@ -112,9 +112,12 @@ func (a *App) collectSelf(r *metrics.Recorder) {
 	rec.Gauge("config_reloads", float64(a.reloads.Load()))
 	rec.Gauge("config_reload_failures", float64(a.reloadNG.Load()))
 	// Pinned at the limit means probes queue and their timings include the wait.
-	rec.Gauge("probe_slots_used", float64(len(a.sem)))
-	rec.Gauge("probe_slots_total", float64(cap(a.sem)))
+	// An average over the last minute: an instant would be whatever moment of
+	// the probes' bursts a scrape happened to catch.
+	rec.Gauge("probe_slots_used", a.sem.Load())
+	rec.Gauge("probe_slots_total", float64(a.sem.Cap()))
 
+	now := time.Now()
 	for _, r := range a.Runners() {
 		rec.Gauge("probe_targets", float64(len(r.Source.Targets())), "probe", r.Name)
 		// A source that stopped answering keeps serving its last good list.
@@ -127,6 +130,20 @@ func (a *App) collectSelf(r *metrics.Recorder) {
 		rec.Gauge("probe_backends_down", float64(r.Down()), "probe", r.Name)
 		rec.Gauge("probe_runs_paused", float64(r.Paused()), "probe", r.Name)
 		rec.Gauge("probe_sleeping", metrics.Bool(r.Sleeping()), "probe", r.Name)
+		// What was sent beside what was planned: the check on an estimate.
+		rec.Gauge("probe_requests_sent", float64(r.Sent()), "probe", r.Name)
+		if next := r.NextRun(now); !next.IsZero() {
+			rec.Gauge("probe_next_run_timestamp_seconds", float64(next.Unix()), "probe", r.Name)
+		}
+		if r.Quota != nil {
+			spent, u := r.QuotaState(now)
+			rec.Gauge("probe_quota_limit", float64(u.Limit), "probe", r.Name)
+			rec.Gauge("probe_quota_used", float64(u.Used), "probe", r.Name)
+			rec.Gauge("probe_quota_used_ratio", u.Ratio(), "probe", r.Name)
+			rec.Gauge("probe_quota_resets_timestamp_seconds", float64(u.Resets.Unix()), "probe", r.Name)
+			rec.Gauge("probe_quota_exhausted", metrics.Bool(spent), "probe", r.Name)
+			rec.Gauge("probe_runs_over_quota", float64(r.OverQuota()), "probe", r.Name)
+		}
 	}
 }
 

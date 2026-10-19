@@ -43,7 +43,7 @@ func TestRunOnceBoundsGoroutines(t *testing.T) {
 		Name: "many", Kind: "fake", Prober: slow, Source: list,
 		Interval: time.Hour, Timeout: time.Second,
 		Resolver: addrs, Family: resolve.Both, MaxBackends: backends, PerBackend: true,
-		Sem: make(chan struct{}, 16),
+		Sem: NewSlots(16),
 		Log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 

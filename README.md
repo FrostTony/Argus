@@ -180,12 +180,15 @@ HTTP authentication covers basic, bearer and the OAuth2 client-credentials flow.
 A `validators:` list replaces the default "2xx is fine" with named assertions,
 and each one that fails names itself in the failure message.
 
-Options that apply to any type: `interval`, `timeout`, `labels`, `ip_version`,
+Options that apply to any type: `interval` or `cron`, `timeout`, `labels`, `ip_version`,
 `source_ip`, `hostname` (the name presented to the target — Host header and SNI
 — when it differs from the target's own), `requests_per_probe`, `negative_test`
 (success means being refused), `run_on` (a regular expression over the node
-name, so one file can be deployed fleet-wide), and `schedule` — time windows
-with a timezone, for checks that should not page anyone at 04:00.
+name, so one file can be deployed fleet-wide), `schedule` — time windows
+with a timezone, for checks that should not page anyone at 04:00 — and
+`quota`, a cap on the requests a probe sends per hour, day, week or month.
+`timezone` is what `cron`, the quota's periods and the schedule are read in.
+See [Cron and quotas](#cron-and-quotas).
 
 Any probe that speaks TLS takes `check_revoked: true` in its `tls_config`: an
 expiry date says nothing about a key that leaked last week. The answer comes
@@ -213,6 +216,67 @@ outlives the run; `cookies: false` sends every hop bare.
 
 [examples/probes.d/example.yaml](examples/probes.d/example.yaml) is a working
 file with every option demonstrated and commented.
+
+## Cron and quotas
+
+Some targets are paid for by the call, or limit their callers. Two options
+keep a probe's request count a number that is known in advance and cannot be
+exceeded.
+
+**`cron`** runs a probe at the wall-clock times it names instead of every
+`interval` from whenever it started: five fields (minute, hour, day of month,
+month, day of week), names (`mon-fri`, `jan`), lists, ranges and steps, or
+`@hourly`, `@daily`, `@weekly`, `@monthly`, `@yearly`. A probe takes one or
+the other; a cron given over an inherited interval replaces it, and the other
+way round.
+
+```yaml
+probes:
+  - name: paid-api
+    type: http
+    cron: "0 9-18 * * mon-fri"   # on the hour, in working hours
+    timezone: Europe/Moscow
+    quota: {requests: 300, per: month}
+    targets: [https://api.example.com/v1/status]
+```
+
+- There is no jitter and no run at start: every node with this probe runs it
+  at the same minute and at no other, a restart and a reload included. An
+  interval probe runs as soon as it starts, after a random fraction of its
+  interval.
+- Day of month and day of week combine as in Vixie cron: when both are
+  restricted (neither starts with `*`), a day matching either runs.
+- `timeout` × `requests_per_probe` has to fit the shortest gap between two
+  runs, the way it fits an interval; `interval` in `/status.json` is that gap.
+- A series written by a cron probe lives until its next run and `stale_after`
+  past it, so the series of a weekday probe survive the weekend.
+- `argus cron [-tz zone] [-n 5] [-from T -to T] [-json] "expr"` lists the
+  next runs, the shortest gap and the number of runs in a span — the
+  arithmetic a renderer needs to show a request count before it pushes.
+
+**`quota`** caps the requests a probe sends per calendar `per`: `hour`, `day`,
+`week` (from Monday) or `month`, in the probe's `timezone`.
+
+- A request is one check of one address; each repeat of `requests_per_probe`
+  is one more. An `http` check that follows redirects is charged every hop,
+  and a scenario every request its steps sent.
+- A run is admitted whole or not at all. Once resolution says how many
+  addresses there are, the run reserves a check of each and starts only if
+  they fit: half a run would report half the addresses down. What the checks
+  then actually sent replaces the reservation.
+- A run the quota refuses is not a failure: nothing is published, the status
+  page says *paused by quota*, and `argus_probe_quota_exhausted` is 1 until
+  the period turns. `argus_probe_quota_used_ratio` is the share spent, for an
+  alert before it is: `argus_probe_quota_used_ratio > 0.8`.
+- On-demand runs of a configured probe — `POST /api/probes`, `/api/check`,
+  `/probe`, a scenario started through the API — draw on the same quota and
+  answer 429, with `Retry-After`, when it is spent.
+- The count is kept per node and saved, so a restart or a crash loop does not
+  hand out a period again: `probing.quota_file` in `argus.yaml`, or
+  `quota.json` beside the `-state` file. With neither the count is in memory
+  only, and the node says so at start.
+- Nodes do not share a count: a probe on three nodes has a quota on each.
+  Whoever renders the configuration divides.
 
 ## Scenarios
 
@@ -428,6 +492,11 @@ belongs to one address also carries `backend` and `family`.
 | `probe_runs_skipped` | runs dropped because the previous one was still going | +1 per overlap |
 | `probe_runs_paused`, `probe_sleeping` | runs the `schedule` suppressed, and whether it is suppressing now | +1 per skipped tick; the gauge is 1 inside a closed window |
 | `probe_panics` | prober calls that panicked | +1, and the run is failed rather than the node |
+| `probe_requests_sent` | requests the probe's runs sent its targets | every check of an address, repeat, redirect hop and scenario request |
+| `probe_next_run_timestamp_seconds` | when a `cron` probe runs next | unix timestamp; absent for an interval probe |
+| `probe_quota_limit`, `probe_quota_used`, `probe_quota_resets_timestamp_seconds` | the `quota` and how much of the current period is gone | used counts what was sent; resets is a unix timestamp |
+| `probe_quota_used_ratio` | how much of the quota is spent | used / limit: 0.8 is 80%, 1 is spent; above 1 by the redirect hops of the last run |
+| `probe_quota_exhausted`, `probe_runs_over_quota` | whether the quota has the probe paused, and how many runs it refused | 1 until the period turns; +1 per refused run |
 
 ### `http`
 
@@ -582,9 +651,17 @@ agent rather than to anything it checks.
 `argus_build_info{val}`, `argus_uptime_seconds`, `argus_goroutines`,
 `argus_memory_bytes`, `argus_series`, `argus_series_dropped`,
 `argus_probes_configured`, `argus_probe_targets`, `argus_probe_slots_used`,
-`argus_probe_slots_total`, `argus_config_reloads`,
-`argus_config_reload_failures`, `argus_discovery_failures`,
-`argus_discovery_age_seconds`.
+`argus_probe_slots_total`, `argus_probe_requests_sent`,
+`argus_probe_next_run_timestamp_seconds`,
+`argus_probe_quota_*`, `argus_config_reloads`, `argus_config_reload_failures`,
+`argus_discovery_failures`, `argus_discovery_age_seconds`.
+
+`argus_probe_slots_used` is the average number of slots in use over the last
+minute, not the count at the moment of the scrape. Probes on a shared interval
+leave in a burst, and an instant read between bursts would be zero at every
+scrape until a restart moved the phase; a minute holds each 60s probe once,
+whatever its phase. `argus_probe_slots_used / argus_probe_slots_total` is the
+load.
 
 Cardinality is bounded on purpose. `max_series` caps the store; samples beyond
 it are refused and counted in `argus_series_dropped`. Series for a target that
@@ -611,7 +688,7 @@ disappears stop being written and are retired after `stale_after`.
 | `GET /api/config` | read | the current check configuration as accepted, `${VAR}` unexpanded |
 | `PUT\|POST /api/config` | write | replace it, and write it back to disk (`-state`, or the single `-probes` file) |
 | `POST /api/reload` | write | re-read the files |
-| `POST /api/probes` | write | run a probe now, off its schedule (`?name=` for one) |
+| `POST /api/probes` | write | run a probe now, off its schedule (`?name=` for one); 429 when its quota is spent |
 | `GET\|POST /api/check` | read / write | run a check once and return the result as JSON |
 | `GET /probe?probe=X&target=Y` | read / write | run a check once and return it as a Prometheus exposition |
 | `GET /api/scenarios` | read | the scenarios this node runs, and each one's last run per target, step by step |

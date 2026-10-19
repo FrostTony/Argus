@@ -75,6 +75,10 @@ probing:
   # exposed. It is the backstop, and the whole memory of the status page: gauges
   # a run did not repeat, and those of a backend that left DNS, go at once.
   stale_after: 10m
+  # Where the requests counted against probes' quotas are saved, so that a
+  # restart does not hand a period out again. Unset, it is quota.json beside
+  # the -state file; with neither, the counts live in memory only.
+  # quota_file: /var/lib/argus/quota.json
   # Hard ceiling on the metric store; past it new series are dropped and counted
   # in argus_series_dropped rather than growing until the node runs out of memory.
   max_series: 500000

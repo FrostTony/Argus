@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"slices"
 	"strconv"
@@ -54,6 +55,9 @@ type run struct {
 	scope   *scope
 	session session
 	report  Report
+	// sent counts the requests the walk sent, every redirect hop one: what a
+	// quota is charged. The steps run one after another, so it needs no lock.
+	sent int
 }
 
 // steps walks the steps in order and stops at the first that fails.
@@ -201,6 +205,7 @@ func (r *run) exchange(ctx context.Context, base *url.URL, st *step) (*response,
 		client = r.session.stay
 	}
 	resp, err := client.Do(req)
+	r.sent += 1 + hops(resp)
 	if err != nil {
 		// Without the URL net/http wraps it in: the report names the step,
 		// and the URL may carry a secret in its query.
@@ -377,4 +382,16 @@ func bounded(msg string) string {
 		n--
 	}
 	return msg[:n] + "…"
+}
+
+// hops counts the redirects followed before resp, each a request of its own.
+func hops(resp *http.Response) int {
+	if resp == nil {
+		return 0
+	}
+	n := 0
+	for r := resp.Request; r != nil && r.Response != nil; r = r.Response.Request {
+		n++
+	}
+	return n
 }

@@ -26,6 +26,7 @@ import (
 	"github.com/tonyamdfrost-cmd/Argus/internal/app"
 	"github.com/tonyamdfrost-cmd/Argus/internal/config"
 	"github.com/tonyamdfrost-cmd/Argus/internal/metrics"
+	"github.com/tonyamdfrost-cmd/Argus/internal/probe"
 	"github.com/tonyamdfrost-cmd/Argus/internal/surfacer"
 )
 
@@ -202,7 +203,7 @@ func (s *api) check(w http.ResponseWriter, r *http.Request) {
 
 	res, err := s.app.Check(ctx, req)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errorBody{err.Error()})
+		writeJSON(w, checkStatus(w, err), errorBody{err.Error()})
 		return
 	}
 	// The HTTP status describes the API call, not the check's outcome.
@@ -211,6 +212,28 @@ func (s *api) check(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, res)
+}
+
+// checkStatus is the answer to an on-demand check that did not run: 429 when
+// the probe's quota has no room left — the caller may try again once it
+// resets, which the message names — and 400 for anything wrong with the ask.
+func checkStatus(w http.ResponseWriter, err error) int {
+	if errors.Is(err, probe.ErrQuota) {
+		return quotaStatus(w, err)
+	}
+	return http.StatusBadRequest
+}
+
+// quotaStatus answers a run the quota refused: 429, with Retry-After set to
+// when the period turns.
+func quotaStatus(w http.ResponseWriter, err error) int {
+	var qe *probe.QuotaError
+	if errors.As(err, &qe) {
+		if wait := time.Until(qe.Usage.Resets); wait > 0 {
+			w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		}
+	}
+	return http.StatusTooManyRequests
 }
 
 // render writes one set of samples. The aliases go through a store of their own
@@ -264,7 +287,7 @@ func (s *api) probeExposition(w http.ResponseWriter, r *http.Request) {
 
 	exp, err := s.app.Samples(ctx, req)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errorBody{err.Error()})
+		writeJSON(w, checkStatus(w, err), errorBody{err.Error()})
 		return
 	}
 	exposition := s.app.Cfg.Exposition()
@@ -474,8 +497,11 @@ func (s *api) probes(w http.ResponseWriter, r *http.Request) {
 	if err := s.app.RunOnce(ctx, name); err != nil {
 		// 404 means unconfigured, so a busy probe must answer 409 instead.
 		code := http.StatusNotFound
-		if errors.Is(err, app.ErrBusy) {
+		switch {
+		case errors.Is(err, app.ErrBusy):
 			code = http.StatusConflict
+		case errors.Is(err, probe.ErrQuota):
+			code = quotaStatus(w, err)
 		}
 		writeJSON(w, code, errorBody{err.Error()})
 		return
@@ -513,6 +539,9 @@ func (s *api) runScenario(w http.ResponseWriter, r *http.Request) {
 		return
 	case errors.Is(err, app.ErrBusy):
 		writeJSON(w, http.StatusConflict, errorBody{err.Error()})
+		return
+	case errors.Is(err, probe.ErrQuota):
+		writeJSON(w, quotaStatus(w, err), errorBody{err.Error()})
 		return
 	case err != nil:
 		writeJSON(w, http.StatusServiceUnavailable, errorBody{err.Error()})

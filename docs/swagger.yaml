@@ -274,6 +274,7 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/Error"}
         "401": {$ref: "#/components/responses/Unauthorized"}
+        "429": {$ref: "#/components/responses/QuotaExhausted"}
         "405": {$ref: "#/components/responses/MethodNotAllowed"}
 
   /api/config:
@@ -476,6 +477,7 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/Error"}
         "401": {$ref: "#/components/responses/Unauthorized"}
+        "429": {$ref: "#/components/responses/QuotaExhausted"}
         "404":
           description: No probe of that name is configured on this node.
           content:
@@ -525,6 +527,7 @@ paths:
             application/json:
               schema: {$ref: "#/components/schemas/Error"}
         "401": {$ref: "#/components/responses/Unauthorized"}
+        "429": {$ref: "#/components/responses/QuotaExhausted"}
         "405": {$ref: "#/components/responses/MethodNotAllowed"}
     post:
       tags: [checks]
@@ -562,6 +565,7 @@ paths:
               schema: {$ref: "#/components/schemas/CheckResult"}
         "400": {$ref: "#/components/responses/BadRequest"}
         "401": {$ref: "#/components/responses/Unauthorized"}
+        "429": {$ref: "#/components/responses/QuotaExhausted"}
     put:
       tags: [checks]
       summary: Check a probe definition that is not in the configuration
@@ -658,6 +662,7 @@ paths:
                 required: [started, status]
               example: {started: video-pipeline, status: /api/scenarios/video-pipeline}
         "401": {$ref: "#/components/responses/Unauthorized"}
+        "429": {$ref: "#/components/responses/QuotaExhausted"}
         "404":
           description: No scenario of that name runs on this node.
           content:
@@ -813,6 +818,21 @@ components:
       content:
         application/json:
           schema: {$ref: "#/components/schemas/Error"}
+    QuotaExhausted:
+      description: |
+        The probe's `quota` has no room left for this run in the current
+        period, and nothing was sent. On-demand runs and checks of a configured
+        probe draw on the same quota as its scheduled runs. The message names
+        what is used and when the period turns.
+      headers:
+        Retry-After:
+          description: Seconds until the period turns and the quota is whole again.
+          schema: {type: integer}
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+          example:
+            error: 'probe "paid-api": quota exhausted: 720 of 720 requests per month used, a run needs 1; it resets at 2026-11-01T00:00:00+03:00'
 
   schemas:
     Error:
@@ -885,7 +905,45 @@ components:
         targets:
           type: array
           items: {type: string}
-      required: [name, type, interval, timeout, per_backend, targets]
+        cron:
+          type: string
+          description: |
+            The probe's cron, when it runs on one rather than every interval.
+            `interval` is then the shortest gap between two of its runs.
+          example: "0 * * * *"
+        next_run:
+          type: string
+          format: date-time
+          description: When the cron runs the probe next.
+        quota: {$ref: "#/components/schemas/QuotaStatus"}
+        requests_sent:
+          type: integer
+          description: |
+            Requests the probe's runs sent its targets since the node started
+            or the probe last changed — redirect hops and scenario steps each
+            one. Set beside a planned count, it shows how far the plan is off.
+      required: [name, type, interval, timeout, per_backend, targets, requests_sent]
+
+    QuotaStatus:
+      type: object
+      description: |
+        A probe's quota in its current period. The count is per node and
+        survives restarts (`probing.quota_file`, or beside `-state`).
+      properties:
+        limit: {type: integer, example: 720}
+        per: {type: string, enum: [hour, day, week, month]}
+        used: {type: integer, example: 312}
+        remaining: {type: integer, example: 408}
+        used_ratio:
+          type: number
+          example: 0.433
+          description: Used over limit — 1 is spent; above 1 by the redirect hops of the last run.
+        resets: {type: string, format: date-time, description: When the period turns.}
+        exhausted:
+          type: boolean
+          description: Too little is left for a single check; the probe is paused until `resets`.
+        refused: {type: integer, description: Runs the quota turned away since the node started.}
+      required: [limit, per, used, remaining, used_ratio, resets, refused]
 
     StateView:
       type: object
@@ -916,6 +974,9 @@ components:
         interval: {type: string}
         sleeping: {type: boolean}
         negative: {type: boolean}
+        cron: {type: string}
+        next_run: {type: string, format: date-time}
+        quota: {$ref: "#/components/schemas/QuotaStatus"}
         targets:
           type: array
           items: {$ref: "#/components/schemas/TargetState"}

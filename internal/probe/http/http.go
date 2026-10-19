@@ -252,6 +252,10 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 	res.Overhead = time.Since(authStart)
 
 	resp, err := client.Do(httpReq)
+	if resp != nil {
+		// Every hop of a redirect chain is a request the target answered.
+		res.Requests = 1 + hops(resp)
+	}
 	if err != nil {
 		// A redirect refused on the way (the limit, another host) still came with
 		// the hops before it: the chain is what explains the failure - a loop shows

@@ -2,6 +2,7 @@ package probe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/tonyamdfrost-cmd/Argus/internal/config"
 	"github.com/tonyamdfrost-cmd/Argus/internal/metrics"
+	"github.com/tonyamdfrost-cmd/Argus/internal/quota"
 	"github.com/tonyamdfrost-cmd/Argus/internal/resolve"
 )
 
@@ -52,6 +54,13 @@ type Runner struct {
 	// Schedule, when set, decides whether a tick runs. It is owned by this runner,
 	// never shared with configuration a reload rewrites.
 	Schedule *config.Compiled
+	// Cron, when set, runs the probe at the wall-clock times it names instead
+	// of every Interval from whenever it started; Interval is then the
+	// shortest gap between two of its runs.
+	Cron *config.Cron
+	// Quota, when set, is what every run draws its requests from, on-demand
+	// runs included. A run it has no room for is not started.
+	Quota *quota.Account
 	// Negative inverts the outcome: the check passes when it fails.
 	Negative bool
 	// Requests repeats the check within one run, for a better latency sample.
@@ -60,8 +69,9 @@ type Runner struct {
 	// target is called.
 	Hostname string
 
-	// Sem caps simultaneous backend requests across the whole node.
-	Sem chan struct{}
+	// Sem caps simultaneous backend requests across the whole node; nil is
+	// no cap.
+	Sem *Slots
 	Log *slog.Logger
 
 	// Capture asks every request of the run for artifacts; see Request.Capture.
@@ -71,9 +81,14 @@ type Runner struct {
 	// keep only the reason.
 	Observe func(req Request, res Result)
 
-	skipped atomic.Int64
-	panics  atomic.Int64
-	paused  atomic.Int64
+	skipped   atomic.Int64
+	panics    atomic.Int64
+	paused    atomic.Int64
+	overQuota atomic.Int64
+	sent      atomic.Int64
+
+	// wait replaces waitUntil's sleep in tests, where a minute is long.
+	wait func(context.Context, time.Time) bool
 
 	once   sync.Once
 	health *health
@@ -108,11 +123,29 @@ func (r *Runner) Paused() int64 { return r.paused.Load() }
 // Sleeping reports whether the schedule suppresses this probe.
 func (r *Runner) Sleeping() bool { return !r.Schedule.Active(time.Now()) }
 
+// OverQuota counts runs the quota had no room for.
+func (r *Runner) OverQuota() int64 { return r.overQuota.Load() }
+
+// Sent counts the requests this runner's runs have sent its targets.
+func (r *Runner) Sent() int64 { return r.sent.Load() }
+
+// NextRun is when the cron runs the probe next; zero for a probe on an interval.
+func (r *Runner) NextRun(now time.Time) time.Time {
+	if r.Cron == nil {
+		return time.Time{}
+	}
+	return r.Cron.Next(now)
+}
+
 func (r *Runner) Panics() int64 { return r.panics.Load() }
 
 // Start probes until the context is cancelled. The first run is staggered so the
 // node's probes do not leave in one wave.
 func (r *Runner) Start(ctx context.Context, sink metrics.Sink, jitter float64) {
+	if r.Cron != nil {
+		r.startCron(ctx, sink)
+		return
+	}
 	if delay := stagger(r.Interval, jitter); delay > 0 {
 		select {
 		case <-time.After(delay):
@@ -154,15 +187,79 @@ func (r *Runner) Start(ctx context.Context, sink metrics.Sink, jitter float64) {
 	}
 }
 
-// RunNow runs immediately unless a run is in progress, and reports whether it
-// ran: on-demand runs share health state with the scheduled ones.
-func (r *Runner) RunNow(ctx context.Context, sink metrics.Sink) bool {
-	if !r.tryEnter() {
+// startCron runs the probe at its cron's times. There is no stagger and no
+// run at start: the point of a cron is that every node runs at the minute it
+// names and at no other, a restart and a reload included. The jitter that
+// spreads an interval's first run is what a cron is chosen to avoid.
+func (r *Runner) startCron(ctx context.Context, sink metrics.Sink) {
+	// A reload hands on the last run of the probe this one replaced; the next
+	// tick must not overlap it, so its end is waited for here.
+	if !r.enter(ctx) {
+		return
+	}
+	r.leave()
+
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	// last is the time the previous tick was for. Each wait is measured on the
+	// wall clock, so a clock stepped back while waiting could otherwise wake
+	// before that time is past and name it again.
+	var last time.Time
+	for {
+		from := time.Now()
+		if from.Before(last) {
+			from = last
+		}
+		next := r.Cron.Next(from)
+		if next.IsZero() {
+			// Validation refuses a cron with no next run within its horizon;
+			// one reached anyway waits for the configuration to change.
+			r.Log.Error("cron names no time ahead; the probe will not run", "probe", r.Name, "cron", r.Cron.String())
+			<-ctx.Done()
+			return
+		}
+		if !r.waitUntil(ctx, next) {
+			return
+		}
+		last = next
+		// Its own goroutine, as an interval's tick is: a slow run must not
+		// push the next one back, and tick prevents overlap.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r.tick(ctx, sink, false)
+		}()
+	}
+}
+
+// waitUntil sleeps until t and reports false if the context ended first.
+func (r *Runner) waitUntil(ctx context.Context, t time.Time) bool {
+	if r.wait != nil {
+		return r.wait(ctx, t)
+	}
+	timer := time.NewTimer(time.Until(t))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
 		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// RunNow runs immediately unless a run is in progress, and reports whether it
+// ran and, if the quota turned it away, why: on-demand runs share health
+// state and quota with the scheduled ones.
+func (r *Runner) RunNow(ctx context.Context, sink metrics.Sink) (bool, error) {
+	if !r.tryEnter() {
+		return false, nil
 	}
 	defer r.leave()
-	r.RunOnce(ctx, sink)
-	return true
+	err := r.Run(ctx, sink)
+	if !errors.Is(err, ErrQuota) {
+		err = nil
+	}
+	return true, err
 }
 
 // Go starts a run in the background unless one is in progress, and reports
@@ -240,9 +337,81 @@ func stagger(interval time.Duration, jitter float64) time.Duration {
 	return time.Duration(rand.Float64() * jitter * float64(interval))
 }
 
-// RunOnce probes every target once: resolution first, then the probes. The
+// ErrQuota is what Run returns when the probe's quota has no room for the run.
+var ErrQuota = errors.New("quota exhausted")
+
+// QuotaError is ErrQuota with the numbers: what the run needed, what is used
+// and when the period turns.
+type QuotaError struct {
+	Probe string
+	Need  int
+	Usage quota.Usage
+}
+
+func (e *QuotaError) Error() string {
+	return fmt.Sprintf("probe %q: quota exhausted: %d of %d requests per %s used, a run needs %d; it resets at %s",
+		e.Probe, e.Usage.Used, e.Usage.Limit, e.Usage.Per, e.Need, e.Usage.Resets.Format(time.RFC3339))
+}
+
+func (e *QuotaError) Is(target error) bool { return target == ErrQuota }
+
+// RunOnce probes every target once. A run the quota refuses is counted and
+// logged; see Run for a caller who needs to know.
+func (r *Runner) RunOnce(ctx context.Context, sink metrics.Sink) { _ = r.Run(ctx, sink) }
+
+// PerCheck is how many requests one check of one address takes at the least,
+// its repeats included.
+func (r *Runner) PerCheck() int {
+	n := 1
+	if c, ok := r.Prober.(Coster); ok {
+		n = max(1, c.Cost())
+	}
+	return n * max(1, r.Requests)
+}
+
+// CheckQuota answers whether the quota has room for a check at all: what a
+// run started in the background is asked before it is promised. The run
+// itself still reserves what it needs once it knows the addresses.
+func (r *Runner) CheckQuota(now time.Time) error {
+	if out, u := r.QuotaState(now); out {
+		return r.refuse(r.PerCheck(), u)
+	}
+	return nil
+}
+
+// QuotaState is the probe's quota as it stands, and whether it is spent:
+// too little left for a single check. Without a quota it is zero and false.
+func (r *Runner) QuotaState(now time.Time) (bool, quota.Usage) {
+	if r.Quota == nil {
+		return false, quota.Usage{}
+	}
+	u := r.Quota.Usage(now)
+	return u.Remaining() < int64(r.PerCheck()), u
+}
+
+// refuse records a run the quota turned away, logging the first of a period.
+func (r *Runner) refuse(need int, u quota.Usage) error {
+	r.overQuota.Add(1)
+	if r.Quota.FirstRefusal(u.Resets) {
+		r.Log.Warn("quota exhausted, runs wait for the next period",
+			"probe", r.Name, "used", u.Used, "limit", u.Limit, "per", u.Per,
+			"needed", need, "resets", u.Resets.Format(time.RFC3339))
+	}
+	return &QuotaError{Probe: r.Name, Need: need, Usage: u}
+}
+
+// Run probes every target once: resolution first, then the probes. The
 // semaphore is acquired before a goroutine starts, so it bounds stacks too.
-func (r *Runner) RunOnce(ctx context.Context, sink metrics.Sink) {
+//
+// With a quota, the run is admitted whole or not at all: once resolution says
+// how many addresses there are, the run reserves a check of each, and starts
+// only if they all fit. What the checks actually sent — redirect hops, a
+// scenario's steps — replaces the reservation afterwards.
+func (r *Runner) Run(ctx context.Context, sink metrics.Sink) error {
+	// An exhausted quota is refused before anything is asked of DNS.
+	if err := r.CheckQuota(time.Now()); err != nil {
+		return err
+	}
 	targets := r.Source.Targets()
 	r.state().begin()
 
@@ -261,11 +430,22 @@ func (r *Runner) RunOnce(ctx context.Context, sink metrics.Sink) {
 		mu.Unlock()
 	})
 
-	r.probeAll(ctx, units)
+	var reservedAt time.Time
+	need := len(units) * r.PerCheck()
+	if r.Quota != nil {
+		reservedAt = time.Now()
+		if ok, u := r.Quota.Reserve(need, reservedAt); !ok {
+			return r.refuse(need, u)
+		}
+	}
+
+	sent := r.probeAll(ctx, units)
+	r.sent.Add(sent)
+	r.Quota.Settle(need, int(sent), reservedAt)
 
 	// A cancelled run reached only some backends; publishing would call the rest down.
 	if ctx.Err() != nil {
-		return
+		return ctx.Err()
 	}
 
 	now := time.Now()
@@ -282,14 +462,30 @@ func (r *Runner) RunOnce(ctx context.Context, sink metrics.Sink) {
 			r.publish(ctx, sink, rec, now)
 		}
 	}
+	return nil
 }
 
 // publish ships one recorder as the whole truth about its scope: a gauge the run
 // did not write is dropped.
 func (r *Runner) publish(ctx context.Context, sink metrics.Sink, rec *metrics.Recorder, now time.Time) {
 	b := rec.Batch(now)
-	b.Scope, b.Every = rec.Base(), r.Interval
+	b.Scope, b.Every = rec.Base(), r.every(now)
 	sink.Write(ctx, b)
+}
+
+// every is how long a series written now has to last: until the next run has
+// had its time to write it again. For a cron that is the wait for its next
+// time, which on "0 9 * * mon-fri" is a weekend — an interval's length would
+// let the series of a rare probe expire between its runs.
+func (r *Runner) every(now time.Time) time.Duration {
+	if r.Cron == nil {
+		return r.Interval
+	}
+	next := r.Cron.Next(now)
+	if next.IsZero() {
+		return r.Interval
+	}
+	return next.Sub(now) + time.Duration(max(1, r.Requests))*r.Timeout
 }
 
 // targetRun is one target's slice of a run.
@@ -360,21 +556,25 @@ func (r *Runner) plan(ctx context.Context, tr *targetRun) []unit {
 	return out
 }
 
-// probeAll runs the probe calls within the node's concurrency limit.
-func (r *Runner) probeAll(ctx context.Context, units []unit) {
-	var wg sync.WaitGroup
-	defer wg.Wait()
-
+// probeAll runs the probe calls within the node's concurrency limit and
+// reports how many requests they sent.
+func (r *Runner) probeAll(ctx context.Context, units []unit) int64 {
+	var (
+		wg   sync.WaitGroup
+		sent atomic.Int64
+	)
 	for _, u := range units {
 		if !r.acquire(ctx) {
-			return
+			wg.Wait()
+			return sent.Load()
 		}
 		wg.Add(1)
 		go func(u unit) {
 			defer wg.Done()
 			defer r.release()
 
-			ok := r.probeOne(ctx, r.request(u.run.target, u.backend), u.rec)
+			ok, n := r.probeOne(ctx, r.request(u.run.target, u.backend), u.rec)
+			sent.Add(int64(n))
 			if u.rec == u.run.rec {
 				return // self-addressed: the prober wrote into the target's recorder
 			}
@@ -391,6 +591,8 @@ func (r *Runner) probeAll(ctx context.Context, units []unit) {
 			u.run.rec.Append(u.rec.Samples()...)
 		}(u)
 	}
+	wg.Wait()
+	return sent.Load()
 }
 
 func (r *Runner) request(t Target, b Backend) Request {
@@ -400,27 +602,13 @@ func (r *Runner) request(t Target, b Backend) Request {
 	}
 }
 
-func (r *Runner) acquire(ctx context.Context) bool {
-	if r.Sem == nil {
-		return ctx.Err() == nil
-	}
-	select {
-	case r.Sem <- struct{}{}:
-		return true
-	case <-ctx.Done():
-		return false
-	}
-}
+func (r *Runner) acquire(ctx context.Context) bool { return r.Sem.Acquire(ctx) }
 
-func (r *Runner) release() {
-	if r.Sem != nil {
-		<-r.Sem
-	}
-}
+func (r *Runner) release() { r.Sem.Release() }
 
 // resolveWorkers keeps resolution from spawning a goroutine per target.
 func (r *Runner) resolveWorkers(targets int) int {
-	n := cap(r.Sem)
+	n := r.Sem.Cap()
 	if n == 0 {
 		n = defaultResolveWorkers
 	}
@@ -542,11 +730,15 @@ func (r *Runner) resolveOnce(ctx context.Context, host string, family resolve.Fa
 	return res, err
 }
 
-func (r *Runner) probeOne(ctx context.Context, req Request, rec *metrics.Recorder) bool {
+// probeOne checks one address, its repeats included, and reports whether it
+// passed and how many requests that took.
+func (r *Runner) probeOne(ctx context.Context, req Request, rec *metrics.Recorder) (bool, int) {
 	var res Result
 	var elapsed time.Duration
+	sent := 0
 	for range max(1, r.Requests) {
 		res, elapsed = r.attempt(ctx, req, rec)
+		sent += res.Sent()
 		if !res.OK() {
 			break // a failure is the answer; repeating it only adds load
 		}
@@ -567,7 +759,7 @@ func (r *Runner) probeOne(ctx context.Context, req Request, rec *metrics.Recorde
 	if ctx.Err() == nil {
 		r.logResult(req, rec.Base(), ok, elapsed, res.Err)
 	}
-	return ok
+	return ok, sent
 }
 
 // attempt is one request of a run, under a timeout of its own.

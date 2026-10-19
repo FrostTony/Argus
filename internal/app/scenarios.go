@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/tonyamdfrost-cmd/Argus/internal/config"
 	"github.com/tonyamdfrost-cmd/Argus/internal/metrics"
@@ -20,8 +21,11 @@ var ErrNotRunning = errors.New("the node is not running")
 // ScenarioStatus is a scenario as the API describes it: what it does and how
 // its last run against each target went.
 type ScenarioStatus struct {
-	Name     string            `json:"name"`
-	Interval string            `json:"interval"`
+	Name     string `json:"name"`
+	Interval string `json:"interval"`
+	// Cron is the scenario's cron when it runs on one; Interval is then the
+	// shortest gap between two runs.
+	Cron     string            `json:"cron,omitempty"`
 	Timeout  string            `json:"timeout"`
 	Targets  []string          `json:"targets"`
 	Running  bool              `json:"running"`
@@ -73,6 +77,9 @@ func describe(r *running) (ScenarioStatus, bool) {
 		Cleanup:  cleanup,
 		LastRuns: []scenario.Report{},
 	}
+	if r.runner.Cron != nil {
+		st.Cron = r.runner.Cron.String()
+	}
 	current := map[string]bool{}
 	for _, t := range r.runner.Source.Targets() {
 		st.Targets = append(st.Targets, t.Name)
@@ -95,6 +102,11 @@ func (a *App) RunScenario(name string) error {
 	r := a.find(name)
 	if r == nil || r.runner.Kind != config.ScenarioType {
 		return fmt.Errorf("%w: no scenario %q runs on this node", ErrNotFound, name)
+	}
+	// Asked now, while someone is there to be told: the run starts in the
+	// background, where a refusal would only reach the log.
+	if err := r.runner.CheckQuota(time.Now()); err != nil {
+		return err
 	}
 	a.mu.Lock()
 	if a.rootCtx == nil || a.stopped {

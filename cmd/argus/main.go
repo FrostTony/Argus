@@ -58,6 +58,7 @@ argus ` + version + ` - active monitoring for domains
   argus run       -config argus.yaml -state probes.yaml    run the node on what the API pushes
   argus validate  -config argus.yaml -probes probes.d/     check the configuration
   argus oneshot   -probes probes.d/ [-probe name]          run every probe once and print metrics
+  argus cron      [-tz zone] [-n 5] [-json] "0 * * * *"    when a cron runs, and how often
   argus kinds                                              list probe types
   argus version
 
@@ -85,6 +86,8 @@ func run(args []string) error {
 		return cmdValidate(rest)
 	case "oneshot":
 		return cmdOneshot(rest)
+	case "cron":
+		return cmdCron(rest)
 	case "kinds":
 		fmt.Println(strings.Join(probe.Kinds(), "\n"))
 		return nil
@@ -145,6 +148,11 @@ func load(f *flags) (config.Server, checks, *slog.Logger, error) {
 	srv, err := config.LoadServer(f.server)
 	if err != nil {
 		return srv, checks{}, nil, err
+	}
+	// The quota counts belong with what was pushed: the state directory is
+	// the one place a node is sure to keep across restarts.
+	if srv.Probing.QuotaFile == "" && f.state != "" {
+		srv.Probing.QuotaFile = filepath.Join(filepath.Dir(f.state), "quota.json")
 	}
 	if f.level != "" {
 		srv.Logging.Level = f.level
@@ -460,8 +468,15 @@ func cmdValidate(args []string) error {
 	}
 	fmt.Printf("configuration is valid: %d probe(s), %d target(s)\n", len(st.Probes), targets)
 	for _, p := range st.Probes {
-		fmt.Printf("  %-24s %-8s interval=%-6s timeout=%-6s targets=%d\n",
-			p.Name, p.Type, p.Interval, p.Timeout, len(p.Targets))
+		cadence := "interval=" + p.Interval
+		if p.Cron != "" {
+			cadence = fmt.Sprintf("cron=%q", p.Cron)
+		}
+		line := fmt.Sprintf("  %-24s %-8s %-6s timeout=%-6s targets=%d", p.Name, p.Type, cadence, p.Timeout, len(p.Targets))
+		if q := p.Quota; q != nil {
+			line += fmt.Sprintf(" quota=%d/%s", q.Limit, q.Per)
+		}
+		fmt.Println(line)
 	}
 	for _, line := range idle {
 		fmt.Println(line)

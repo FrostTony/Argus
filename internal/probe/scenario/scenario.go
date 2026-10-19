@@ -135,6 +135,7 @@ func (p *Prober) Probe(ctx context.Context, req probe.Request, rec *metrics.Reco
 	start := time.Now()
 	r.cleanup(ctx, base)
 	res.Overhead += time.Since(start)
+	res.Requests = r.sent
 
 	res.Err = r.redact(res.Err)
 	return res
@@ -252,6 +253,11 @@ func (p *Prober) Reports() []Report {
 	slices.SortFunc(out, func(a, b Report) int { return strings.Compare(a.Target, b.Target) })
 	return out
 }
+
+// Cost implements probe.Coster: a walk that goes as planned sends each step
+// and each cleanup step once. A step that waits with until: asks again, and
+// those requests are counted as they are sent.
+func (p *Prober) Cost() int { return len(p.sc.steps) + len(p.sc.cleanup) }
 
 // Steps names the steps and the cleanup steps, in the order they run.
 func (p *Prober) Steps() (steps, cleanup []string) {

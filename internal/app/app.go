@@ -22,6 +22,7 @@ import (
 	"github.com/tonyamdfrost-cmd/Argus/internal/discovery"
 	"github.com/tonyamdfrost-cmd/Argus/internal/metrics"
 	"github.com/tonyamdfrost-cmd/Argus/internal/probe"
+	"github.com/tonyamdfrost-cmd/Argus/internal/quota"
 	"github.com/tonyamdfrost-cmd/Argus/internal/resolve"
 	"github.com/tonyamdfrost-cmd/Argus/internal/surfacer"
 )
@@ -37,10 +38,13 @@ type App struct {
 	// sem caps the scheduled runs' backend requests; adhoc caps the
 	// on-demand ones apart, so that callers of /probe and /api/check, read
 	// tokens included, cannot take the slots monitoring runs on.
-	sem   chan struct{}
-	adhoc chan struct{}
+	sem   *probe.Slots
+	adhoc *probe.Slots
 	// trials are runs of scenarios not configured here, see TryScenario.
-	trials    trials
+	trials trials
+	// ledger counts the requests of every probe with a quota; it outlives
+	// reloads and, through its file, restarts.
+	ledger    *quota.Ledger
 	buckets   metrics.Buckets
 	closers   []func() error
 	reopeners []func() error
@@ -86,10 +90,10 @@ func newRunning(r *probe.Runner, fingerprint string) *running {
 
 // runNow is an on-demand run. It ends with the probe as well as with the
 // caller: one outliving a reload would write series the reload has dropped.
-func (r *running) runNow(ctx context.Context, sink metrics.Sink) bool {
+func (r *running) runNow(ctx context.Context, sink metrics.Sink) (bool, error) {
 	ctx, leave, ok := r.enter(ctx)
 	if !ok {
-		return true // the probe is gone; there is nothing left to run
+		return true, nil // the probe is gone; there is nothing left to run
 	}
 	defer leave()
 	return r.runner.RunNow(ctx, sink)
@@ -137,10 +141,11 @@ func Build(server config.Server, probes config.Probes, log *slog.Logger) (*App, 
 		Cfg:     server,
 		Log:     log,
 		Store:   metrics.NewStore(server.Probing.StaleAfter.D(), server.Probing.MaxSeries),
-		sem:     make(chan struct{}, max(1, server.Probing.MaxConcurrent)),
-		adhoc:   make(chan struct{}, max(1, server.Probing.MaxConcurrent/4)),
+		sem:     probe.NewSlots(server.Probing.MaxConcurrent),
+		adhoc:   probe.NewSlots(server.Probing.MaxConcurrent / 4),
 		buckets: metrics.Buckets(server.Probing.LatencyBuckets),
 		probes:  map[string]*running{},
+		ledger:  quota.Open(server.Probing.QuotaFile, log),
 	}
 	if len(a.buckets) == 0 {
 		a.buckets = metrics.DefaultLatencyBuckets
@@ -259,6 +264,7 @@ func (a *App) apply(probes config.Probes) error {
 
 	next := make(map[string]*running, len(list))
 	order := make([]string, 0, len(list))
+	counted := false
 
 	for _, pc := range list {
 		if config.Enabled(pc.Disabled, false) {
@@ -267,6 +273,7 @@ func (a *App) apply(probes config.Probes) error {
 		if !a.runsHere(pc) {
 			continue
 		}
+		counted = counted || pc.Quota != nil
 		fp, err := fingerprint(pc)
 		if err != nil {
 			return err
@@ -286,6 +293,10 @@ func (a *App) apply(probes config.Probes) error {
 		}
 		next[pc.Name] = newRunning(r, fp)
 		order = append(order, pc.Name)
+	}
+	if counted && a.Cfg.Probing.QuotaFile == "" {
+		a.Log.Warn("probes have a quota, but the counts are kept in memory only: a restart starts " +
+			"the period over. Set probing.quota_file, or run with -state")
 	}
 	if len(next) == 0 {
 		// Legal: a node that has just been installed, or one whose last domain
@@ -382,6 +393,19 @@ func digest(p probe.Prober) string {
 }
 
 func (a *App) buildRunner(pc config.Probe, nodeLabels metrics.Labels) (*probe.Runner, error) {
+	loc, err := pc.Location()
+	if err != nil {
+		return nil, fmt.Errorf("probe %q: %w", pc.Name, err)
+	}
+	var cron *config.Cron
+	if pc.Cron != "" {
+		if cron, err = config.ParseCron(pc.Cron, loc); err != nil {
+			return nil, fmt.Errorf("probe %q: %w", pc.Name, err)
+		}
+		// What has to fit between two runs — the timeout and its repeats, a
+		// scenario's steps — fits the closest two the cron names.
+		pc.Interval = config.Duration(cron.MinGap())
+	}
 	prober, err := probe.New(pc)
 	if err != nil {
 		return nil, err
@@ -403,7 +427,7 @@ func (a *App) buildRunner(pc config.Probe, nodeLabels metrics.Labels) (*probe.Ru
 		return nil, fmt.Errorf("probe %q: %w", pc.Name, err)
 	}
 	// Compiled per runner: the parsed configuration stays pure data.
-	schedule, err := pc.Schedule.Compile()
+	schedule, err := pc.Schedule.CompileIn(loc)
 	if err != nil {
 		return nil, fmt.Errorf("probe %q: %w", pc.Name, err)
 	}
@@ -417,11 +441,15 @@ func (a *App) buildRunner(pc config.Probe, nodeLabels metrics.Labels) (*probe.Ru
 	// Checked on the values the probe runs with: either may be inherited.
 	interval := cmp.Or(pc.Interval.D(), a.Cfg.Probing.Interval.D())
 	timeout := cmp.Or(pc.Timeout.D(), a.Cfg.Probing.Timeout.D())
-	if err := config.CheckTiming(interval, timeout, pc.RequestsPerProbe); err != nil {
+	check := config.CheckTiming
+	if cron != nil {
+		check = config.CheckCronTiming
+	}
+	if err := check(interval, timeout, pc.RequestsPerProbe); err != nil {
 		return nil, fmt.Errorf("probe %q: %w", pc.Name, err)
 	}
 
-	return &probe.Runner{
+	r := &probe.Runner{
 		Name:         pc.Name,
 		Kind:         pc.Type,
 		Prober:       prober,
@@ -436,6 +464,8 @@ func (a *App) buildRunner(pc config.Probe, nodeLabels metrics.Labels) (*probe.Ru
 		Fallback:     config.Enabled(pc.IPFallback, false),
 		SourceIP:     sourceIP,
 		Schedule:     schedule,
+		Cron:         cron,
+		Quota:        a.ledger.Account(pc.Name, pc.Quota, loc),
 		Negative:     config.Enabled(pc.NegativeTest, false),
 		Requests:     pc.RequestsPerProbe,
 		Hostname:     pc.Hostname,
@@ -443,7 +473,16 @@ func (a *App) buildRunner(pc config.Probe, nodeLabels metrics.Labels) (*probe.Ru
 		PerBackend:   config.Enabled(pc.PerBackend, a.Cfg.Probing.PerBackend),
 		Sem:          a.sem,
 		Log:          a.Log,
-	}, nil
+	}
+	// Configuration checks targets x repeats; only the prober knows a check
+	// can be several requests, as a scenario's steps are.
+	if q := pc.Quota; q != nil {
+		if least := r.PerCheck() * max(1, len(pc.Targets.Static)); least > q.Requests {
+			return nil, fmt.Errorf("probe %q: quota.requests (%d) is less than one run takes (%d): the probe would never run",
+				pc.Name, q.Requests, least)
+		}
+	}
+	return r, nil
 }
 
 // runsHere matches run_on against this node's name; an unnamed node runs all.
@@ -584,6 +623,7 @@ func (a *App) ConfigMeta() ConfigMeta {
 // them leaves the scenarios out: one changes the target, and has to be named.
 func (a *App) RunOnce(ctx context.Context, name string) error {
 	found, busy := false, 0
+	var over []error
 	for _, r := range a.current() {
 		if name != "" && r.runner.Name != name {
 			continue
@@ -592,8 +632,12 @@ func (a *App) RunOnce(ctx context.Context, name string) error {
 			continue
 		}
 		found = true
-		if !r.runNow(ctx, a.Sink) {
+		ran, err := r.runNow(ctx, a.Sink)
+		switch {
+		case !ran:
 			busy++
+		case err != nil:
+			over = append(over, err)
 		}
 	}
 	switch {
@@ -603,6 +647,10 @@ func (a *App) RunOnce(ctx context.Context, name string) error {
 		return fmt.Errorf("%w: probe %q", ErrNotFound, name)
 	case busy > 0:
 		return fmt.Errorf("%w: %d probe(s) already running", ErrBusy, busy)
+	case len(over) == 1:
+		return over[0]
+	case len(over) > 1:
+		return fmt.Errorf("%d probes were over quota: %w", len(over), errors.Join(over...))
 	}
 	return nil
 }

@@ -14,12 +14,12 @@ func TestOnDemandChecksDoNotShareScheduledSlots(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = a.Close() })
-	for range cap(a.sem) {
-		a.sem <- struct{}{}
+	for range a.sem.Cap() {
+		a.sem.Acquire(context.Background())
 	}
 	defer func() {
-		for range cap(a.sem) {
-			<-a.sem
+		for range a.sem.Cap() {
+			a.sem.Release()
 		}
 	}()
 
@@ -29,7 +29,7 @@ func TestOnDemandChecksDoNotShareScheduledSlots(t *testing.T) {
 	if err != nil || !res.Success {
 		t.Fatalf("check with the scheduled slots full: %+v, %v", res, err)
 	}
-	if len(a.adhoc) != 0 {
-		t.Errorf("%d on-demand slots left held", len(a.adhoc))
+	if n := a.adhoc.InUse(); n != 0 {
+		t.Errorf("%d on-demand slots left held", n)
 	}
 }

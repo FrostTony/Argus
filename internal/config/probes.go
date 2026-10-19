@@ -68,6 +68,15 @@ type Probe struct {
 
 	// Schedule limits when the probe runs.
 	Schedule *Schedule `yaml:"schedule,omitempty"`
+	// Cron runs the probe at the wall-clock times it names instead of every
+	// interval; a probe takes one or the other.
+	Cron string `yaml:"cron,omitempty"`
+	// Timezone, an IANA name, is what cron, the quota's periods and the
+	// schedule are read in; the node's local time when unset. A schedule's own
+	// timezone wins for the schedule.
+	Timezone string `yaml:"timezone,omitempty"`
+	// Quota caps the requests the probe sends per calendar period.
+	Quota *Quota `yaml:"quota,omitempty"`
 	// NegativeTest inverts the outcome: the check passes when it fails.
 	NegativeTest *bool `yaml:"negative_test,omitempty"`
 	// RequestsPerProbe repeats the check within one interval.
@@ -126,6 +135,10 @@ func (p *Probe) UnmarshalYAML(n *yaml.Node) error {
 		return err
 	}
 	*p = Probe(known)
+	// Within one layer; a layer below gives one up to the layer above.
+	if p.Cron != "" && p.Interval != 0 {
+		return fmt.Errorf("line %d: interval and cron are alternatives: give one", n.Line)
+	}
 
 	switch len(extra) {
 	case 0:
@@ -388,9 +401,30 @@ func (p Probe) validate() error {
 			return fmt.Errorf("source_ip %q is not an address", p.SourceIP)
 		}
 	}
-	// Compiled and thrown away: the runner compiles a copy of its own.
-	if _, err := p.Schedule.Compile(); err != nil {
+	loc, err := p.Location()
+	if err != nil {
 		return err
+	}
+	// Compiled and thrown away: the runner compiles a copy of its own.
+	if _, err := p.Schedule.CompileIn(loc); err != nil {
+		return err
+	}
+	var cron *Cron
+	if p.Cron != "" {
+		if cron, err = ParseCron(p.Cron, loc); err != nil {
+			return err
+		}
+	}
+	if err := p.Quota.validate(); err != nil {
+		return err
+	}
+	// The least a run can cost is one request per target and repeat: a quota
+	// below that would never let the probe run at all.
+	if p.Quota != nil && p.Targets.File == nil && p.Targets.HTTP == nil {
+		if least := len(p.Targets.Static) * max(1, p.RequestsPerProbe); least > p.Quota.Requests {
+			return fmt.Errorf("quota.requests (%d) is less than one run takes: %d target(s) x %d request(s)",
+				p.Quota.Requests, len(p.Targets.Static), max(1, p.RequestsPerProbe))
+		}
 	}
 	if p.RunOn != "" {
 		if _, err := regexp.Compile(p.RunOn); err != nil {
@@ -413,22 +447,49 @@ func (p Probe) validate() error {
 	if err := metrics.Buckets(p.LatencyBuckets).Valid(); err != nil {
 		return fmt.Errorf("latency_buckets: %w", err)
 	}
-	// What is left unset comes from the node; the runner checks again with both.
-	if p.Interval > 0 && p.Timeout > 0 {
+	if p.Timeout == 0 {
+		return nil // what is left unset comes from the node; the runner checks again with both
+	}
+	if cron != nil {
+		return CheckCronTiming(cron.MinGap(), p.Timeout.D(), p.RequestsPerProbe)
+	}
+	if p.Interval > 0 {
 		return CheckTiming(p.Interval.D(), p.Timeout.D(), p.RequestsPerProbe)
 	}
 	return nil
 }
 
+// Location is the probe's timezone, or the node's local time.
+func (p Probe) Location() (*time.Location, error) {
+	if p.Timezone == "" {
+		return time.Local, nil
+	}
+	loc, err := time.LoadLocation(p.Timezone)
+	if err != nil {
+		return nil, fmt.Errorf("timezone: %w", err)
+	}
+	return loc, nil
+}
+
 // CheckTiming validates the interval and timeout a probe ends up with, once the
 // node's defaults have filled what it left out.
 func CheckTiming(interval, timeout time.Duration, requests int) error {
-	if timeout > interval {
-		return fmt.Errorf("timeout (%s) exceeds interval (%s)", timeout, interval)
+	return fitTiming("interval", interval, timeout, requests)
+}
+
+// CheckCronTiming is CheckTiming for a probe on a cron: a run has until the
+// next one, and the closest two runs of the cron are what it must fit.
+func CheckCronTiming(gap, timeout time.Duration, requests int) error {
+	return fitTiming("the shortest gap between cron runs", gap, timeout, requests)
+}
+
+func fitTiming(what string, every, timeout time.Duration, requests int) error {
+	if timeout > every {
+		return fmt.Errorf("timeout (%s) exceeds %s (%s)", timeout, what, every)
 	}
 	// Each repeat has the whole timeout to itself.
-	if worst := time.Duration(max(1, requests)) * timeout; worst > interval {
-		return fmt.Errorf("requests_per_probe (%d) x timeout (%s) exceeds interval (%s)", requests, timeout, interval)
+	if worst := time.Duration(max(1, requests)) * timeout; worst > every {
+		return fmt.Errorf("requests_per_probe (%d) x timeout (%s) exceeds %s (%s)", requests, timeout, what, every)
 	}
 	return nil
 }
@@ -451,7 +512,18 @@ func (p Probe) mergeFrom(other Probe) Probe {
 	}
 	res.Template = other.Template
 	res.Disabled = pick(other.Disabled, p.Disabled)
-	res.Interval = cmp.Or(other.Interval, p.Interval)
+	// The cadence comes whole from the layer that sets one: a cron given over
+	// an inherited interval replaces it, and the other way round.
+	switch {
+	case other.Cron != "":
+		res.Cron, res.Interval = other.Cron, 0
+	case other.Interval != 0:
+		res.Interval, res.Cron = other.Interval, ""
+	}
+	res.Timezone = cmp.Or(other.Timezone, p.Timezone)
+	if other.Quota != nil {
+		res.Quota = other.Quota
+	}
 	res.Timeout = cmp.Or(other.Timeout, p.Timeout)
 	res.PerBackend = pick(other.PerBackend, p.PerBackend)
 	if !other.Targets.Empty() {

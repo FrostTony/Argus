@@ -704,26 +704,47 @@ function makeProbe(p, host){
   head.appendChild(el("span", "name", p.name));
   head.appendChild(el("span", "tag", p.type));
   const sleeping = el("span", "tag warn", "paused by schedule");
+  const spent = el("span", "tag warn", "paused by quota");
   const negative = el("span", "tag warn", "negative check");
   const broken = el("span", "tag bad");
   head.appendChild(sleeping);
+  head.appendChild(spent);
   head.appendChild(negative);
   head.appendChild(broken);
-  head.appendChild(el("span", "every", "every " + p.interval));
+  const every = el("span", "every");
+  head.appendChild(every);
   root.appendChild(head);
 
   const body = el("div");
   root.appendChild(body);
   host.appendChild(root);
 
-  const entry = {root, sleeping, negative, broken, body, targets: []};
+  const entry = {root, sleeping, spent, negative, broken, every, body, targets: []};
   for (const t of p.targets) entry.targets.push(makeTarget(p.name, t, body));
   if (!p.targets.length) body.appendChild(el("div", "empty", "no results yet"));
   view.probes.set(p.name, entry);
   return entry;
 }
 
+// cadence is how often the probe runs, when it runs next on a cron, and how
+// much of its quota is gone.
+function cadence(p){
+  let out = p.cron ? "cron " + p.cron : "every " + p.interval;
+  if (p.next_run){
+    const at = new Date(p.next_run);
+    const today = at.toDateString() === new Date().toDateString();
+    out += " · next " + (today ? "" : at.toLocaleDateString([], {month: "short", day: "numeric"}) + " ") +
+      at.toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", hourCycle: "h23"});
+  }
+  if (p.quota) out += " · quota " + p.quota.used + "/" + p.quota.limit + " per " + p.quota.per +
+    " (" + Math.round(p.quota.used_ratio * 100) + "%)";
+  return out;
+}
+
 function updateProbe(entry, p){
+  txt(entry.every, cadence(p));
+  show(entry.spent, !!(p.quota && p.quota.exhausted));
+  if (p.quota) entry.spent.title = "resets " + new Date(p.quota.resets).toLocaleString();
   show(entry.sleeping, !!p.sleeping);
   show(entry.negative, !!p.negative);
   const down = p.targets.reduce((n, t) => n + (t.total - t.up) + (t.error ? 1 : 0), 0);

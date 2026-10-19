@@ -44,6 +44,9 @@ type scenarioHead struct {
 	Targets         Targets           `yaml:"targets"`
 	RunOn           string            `yaml:"run_on"`
 	Schedule        *Schedule         `yaml:"schedule"`
+	Cron            string            `yaml:"cron"`
+	Timezone        string            `yaml:"timezone"`
+	Quota           *Quota            `yaml:"quota"`
 	SourceIP        string            `yaml:"source_ip"`
 	LatencyBuckets  []float64         `yaml:"latency_buckets"`
 	PhaseHistograms *bool             `yaml:"phase_histograms"`
@@ -90,6 +93,9 @@ func (f *scenarioFile) UnmarshalYAML(n *yaml.Node) error {
 	if err := head.Decode(&h); err != nil {
 		return err
 	}
+	if h.Cron != "" && h.Interval != 0 {
+		return fmt.Errorf("line %d: interval and cron are alternatives: give one", n.Line)
+	}
 	f.probe = Probe{
 		Name:            h.Name,
 		Type:            ScenarioType,
@@ -100,6 +106,9 @@ func (f *scenarioFile) UnmarshalYAML(n *yaml.Node) error {
 		Targets:         h.Targets,
 		RunOn:           h.RunOn,
 		Schedule:        h.Schedule,
+		Cron:            h.Cron,
+		Timezone:        h.Timezone,
+		Quota:           h.Quota,
 		SourceIP:        h.SourceIP,
 		LatencyBuckets:  h.LatencyBuckets,
 		PhaseHistograms: h.PhaseHistograms,
@@ -154,8 +163,8 @@ func LoadScenarios(paths ...string) ([]Probe, error) {
 // that runs for minutes and changes the target on every run gets neither by
 // accident.
 func (p Probe) validateScenario() error {
-	if p.Interval == 0 || p.Timeout == 0 {
-		return fmt.Errorf("scenario %q: interval and timeout are required", p.Name)
+	if (p.Interval == 0 && p.Cron == "") || p.Timeout == 0 {
+		return fmt.Errorf("scenario %q: interval and timeout are required; cron may stand for the interval", p.Name)
 	}
 	if p.Targets.Empty() {
 		return fmt.Errorf("scenario %q: targets are missing", p.Name)

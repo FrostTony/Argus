@@ -31,6 +31,9 @@ func LoadServer(path string) (Server, error) {
 			return cfg, fmt.Errorf("%s: %w", path, err)
 		}
 		cfg.Scenarios.anchor(filepath.Dir(path))
+		if q := cfg.Probing.QuotaFile; q != "" && !filepath.IsAbs(q) {
+			cfg.Probing.QuotaFile = filepath.Join(filepath.Dir(path), q)
+		}
 	}
 	if err := cfg.Validate(); err != nil {
 		return cfg, fmt.Errorf("%s: %w", cmp.Or(path, "<defaults>"), err)

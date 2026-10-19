@@ -137,7 +137,7 @@ func TestRunnerRace(t *testing.T) {
 	r.Resolver = res
 	r.Interval = 5 * time.Millisecond
 	r.Timeout = 5 * time.Millisecond
-	r.Sem = make(chan struct{}, 2)
+	r.Sem = NewSlots(2)
 	store := metrics.NewStore(time.Minute, 0)
 	store.KeepRetired(128)
 

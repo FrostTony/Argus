@@ -54,6 +54,44 @@ type ProbeStatus struct {
 	// Failures maps "target|backend" to the message behind a current failure.
 	Failures map[string]string `json:"failures,omitempty"`
 	Targets  []string          `json:"targets"`
+	// Cron is the probe's cron when it runs on one, and NextRun when it runs
+	// next. Interval is then the shortest gap between two runs.
+	Cron    string `json:"cron,omitempty"`
+	NextRun string `json:"next_run,omitempty"`
+	// Quota is the probe's count in its current period.
+	Quota *QuotaStatus `json:"quota,omitempty"`
+	// RequestsSent counts the requests the probe's runs sent its targets since
+	// the node started or the probe last changed.
+	RequestsSent int64 `json:"requests_sent"`
+}
+
+// QuotaStatus is a probe's quota as it stands.
+type QuotaStatus struct {
+	Limit     int    `json:"limit"`
+	Per       string `json:"per"`
+	Used      int64  `json:"used"`
+	Remaining int64  `json:"remaining"`
+	// UsedRatio is used over limit: 1 is spent, and it can pass 1.
+	UsedRatio float64 `json:"used_ratio"`
+	// Resets is when the period turns, in RFC 3339.
+	Resets string `json:"resets"`
+	// Exhausted is set when too little is left for a single check: the probe
+	// is paused until Resets.
+	Exhausted bool `json:"exhausted,omitempty"`
+	// Refused counts the runs the quota turned away.
+	Refused int64 `json:"refused"`
+}
+
+// quotaStatus describes a runner's quota; nil without one.
+func quotaStatus(r *probe.Runner, now time.Time) *QuotaStatus {
+	if r.Quota == nil {
+		return nil
+	}
+	out, u := r.QuotaState(now)
+	return &QuotaStatus{
+		Limit: u.Limit, Per: u.Per, Used: u.Used, Remaining: u.Remaining(), UsedRatio: u.Ratio(),
+		Resets: u.Resets.Format(time.RFC3339), Exhausted: out, Refused: r.OverQuota(),
+	}
 }
 
 // Status takes a snapshot of what the node is doing right now.
@@ -73,23 +111,33 @@ func (a *App) Status() Status {
 	if !meta.AppliedAt.IsZero() {
 		s.ConfigAppliedAt = meta.AppliedAt.UTC().Format(time.RFC3339)
 	}
+	now := time.Now()
 	for _, r := range runners {
 		targets := r.Source.Targets()
 		names := make([]string, 0, len(targets))
 		for _, t := range targets {
 			names = append(names, t.Name)
 		}
-		s.Probes = append(s.Probes, ProbeStatus{
-			Name:       r.Name,
-			Type:       r.Kind,
-			Interval:   r.Interval.String(),
-			Timeout:    r.Timeout.String(),
-			PerBackend: r.PerBackend,
-			Sleeping:   r.Sleeping(),
-			Negative:   r.Negative,
-			Failures:   messages(r.Failures()),
-			Targets:    names,
-		})
+		ps := ProbeStatus{
+			Name:         r.Name,
+			Type:         r.Kind,
+			Interval:     r.Interval.String(),
+			Timeout:      r.Timeout.String(),
+			PerBackend:   r.PerBackend,
+			Sleeping:     r.Sleeping(),
+			Negative:     r.Negative,
+			Failures:     messages(r.Failures()),
+			Targets:      names,
+			Quota:        quotaStatus(r, now),
+			RequestsSent: r.Sent(),
+		}
+		if r.Cron != nil {
+			ps.Cron = r.Cron.String()
+			if next := r.NextRun(now); !next.IsZero() {
+				ps.NextRun = next.Format(time.RFC3339)
+			}
+		}
+		s.Probes = append(s.Probes, ps)
 	}
 	return s
 }

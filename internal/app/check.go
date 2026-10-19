@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -174,11 +175,20 @@ func (a *App) checkOnce(ctx context.Context, req CheckRequest) (*probe.Runner, *
 	runner.Schedule = nil
 	runner.Capture = policy
 	runner.Sem = a.adhoc
+	// A check of a probe running here sends its requests to the same target
+	// the probe's quota is about, so it draws on that quota: the scheduled
+	// probe's account, whatever quota the request's own definition names.
+	runner.Quota = nil
+	if r := a.find(pc.Name); r != nil {
+		runner.Quota = r.runner.Quota
+	}
 
 	capture := &captureSink{}
 	runner.Observe = capture.observe
 	start := time.Now()
-	runner.RunOnce(ctx, capture)
+	if err := runner.Run(ctx, capture); errors.Is(err, probe.ErrQuota) {
+		return nil, nil, nil, 0, err
+	}
 	return runner, capture, trace, time.Since(start), nil
 }
 
@@ -228,7 +238,9 @@ func (a *App) checkConfig(req CheckRequest) (config.Probe, error) {
 	if pc.Timeout == 0 {
 		pc.Timeout = a.Cfg.Probing.Timeout
 	}
-	// A one-off check has no interval to fit into, so any timeout fits.
+	// A one-off check has no interval to fit into, so any timeout fits, and
+	// no cron to wait for.
+	pc.Cron = ""
 	pc.Interval = max(pc.Interval, a.Cfg.Probing.Interval,
 		config.Duration(max(1, pc.RequestsPerProbe))*pc.Timeout)
 	enabled := false

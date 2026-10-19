@@ -131,7 +131,14 @@ type Result struct {
 	Overhead time.Duration
 	// Artifacts are what the target answered, filled only when Request.Capture is set.
 	Artifacts []Artifact
+	// Requests is how many requests the check sent the target, for a prober
+	// that sends more than one: the hops of a redirect chain, the steps of a
+	// scenario. Zero counts as one. A quota is charged with it.
+	Requests int
 }
+
+// Sent is how many requests the check counts as.
+func (r Result) Sent() int { return max(1, r.Requests) }
 
 // Phase is one named span of a check — connect, tls, ttfb.
 type Phase struct {
@@ -165,6 +172,13 @@ type Prober interface {
 // runner calls them once per target, with no resolution and no backend label.
 type Addressing interface {
 	SelfAddressed() bool
+}
+
+// Coster is implemented by probers whose check sends more than one request,
+// to say how many a check that goes as planned sends: what a run reserves of
+// a quota before it starts. Without it a check counts as one.
+type Coster interface {
+	Cost() int
 }
 
 // FileBacked is implemented by probers built from files; a reload compares their

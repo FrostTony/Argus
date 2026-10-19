@@ -93,6 +93,10 @@ func (a *App) TryScenario(pc config.Probe) (Trial, error) {
 	// A trial holds its session for minutes; the cap is maxTrials, not the
 	// slots scheduled probes and on-demand checks share.
 	runner.Sem = nil
+	// A trial is of a scenario not configured here: there is no probe whose
+	// quota it could spend, and its name must not open an account in the
+	// ledger that outlives it.
+	runner.Quota = nil
 
 	t := &Trial{ID: trialID(), Scenario: pc.Name, Started: time.Now(), Running: true,
 		Targets: []string{}, Reports: []scenario.Report{}}
@@ -120,7 +124,8 @@ func (a *App) TryScenario(pc config.Probe) (Trial, error) {
 	a.live.Add(1)
 	a.mu.Unlock()
 
-	budget := pc.Interval.D() + trialMargin
+	// The runner's interval: a scenario on a cron has the gap between runs.
+	budget := runner.Interval + trialMargin
 	go func() {
 		defer a.live.Done()
 		ctx, cancel := context.WithTimeout(root, budget)

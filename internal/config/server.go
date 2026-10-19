@@ -136,6 +136,10 @@ type Probing struct {
 	// WatchConfig re-reads the check files on this interval and reloads on a
 	// change. Zero, the default, leaves SIGHUP and the API as the only ways in.
 	WatchConfig Duration `yaml:"watch_config"`
+	// QuotaFile is where the requests counted against probes' quotas are
+	// saved, so that a restart does not hand out a period again. Empty puts it
+	// beside -state; with neither, counts live in memory only.
+	QuotaFile string `yaml:"quota_file"`
 }
 
 // Surfacer activates the block named by Type.

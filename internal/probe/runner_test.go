@@ -252,7 +252,7 @@ func TestRunnerRespectsConcurrencyLimit(t *testing.T) {
 	var inFlight, peak atomic.Int64
 	p := &fakeProber{delay: 20 * time.Millisecond}
 	r := newRunner(p, "1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4")
-	r.Sem = make(chan struct{}, 2)
+	r.Sem = NewSlots(2)
 	r.Prober = proberFunc(func(ctx context.Context, req Request, rec *metrics.Recorder) Result {
 		n := inFlight.Add(1)
 		for {
