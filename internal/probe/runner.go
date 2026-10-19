@@ -86,6 +86,10 @@ type Runner struct {
 	paused    atomic.Int64
 	overQuota atomic.Int64
 	sent      atomic.Int64
+	// published is the last run that published: when, and what was failing as
+	// it did. Taken together, so a reader of the stored results gets one run's
+	// samples and that run's failures, not a run still going or one a reload cut.
+	published atomic.Pointer[Published]
 
 	// wait replaces waitUntil's sleep in tests, where a minute is long.
 	wait func(context.Context, time.Time) bool
@@ -109,6 +113,8 @@ func (r *Runner) state() *health {
 // state included when the prober keeps any. Call it before the first run.
 func (r *Runner) Inherit(old *Runner) {
 	r.once.Do(func() { r.health = old.state() })
+	// The series it wrote stay in the store; so does the run that wrote them.
+	r.published.CompareAndSwap(nil, old.published.Load())
 	if h, ok := r.Prober.(Heir); ok {
 		h.Inherit(old.Prober)
 	}
@@ -128,6 +134,24 @@ func (r *Runner) OverQuota() int64 { return r.overQuota.Load() }
 
 // Sent counts the requests this runner's runs have sent its targets.
 func (r *Runner) Sent() int64 { return r.sent.Load() }
+
+// Published is a run that published its results: when, and the failures
+// ("target|backend" to what was wrong) as it published them.
+type Published struct {
+	At       time.Time
+	Failures map[string]Failure
+}
+
+// LastPublished is the last run that published; nil before the first.
+func (r *Runner) LastPublished() *Published { return r.published.Load() }
+
+// LastRun is when a run last published its results; zero before the first.
+func (r *Runner) LastRun() time.Time {
+	if p := r.published.Load(); p != nil {
+		return p.At
+	}
+	return time.Time{}
+}
 
 // NextRun is when the cron runs the probe next; zero for a probe on an interval.
 func (r *Runner) NextRun(now time.Time) time.Time {
@@ -453,23 +477,28 @@ func (r *Runner) Run(ctx context.Context, sink metrics.Sink) error {
 	for _, scope := range r.state().prune() {
 		sink.Write(ctx, metrics.Retire(scope, now))
 	}
+	// One lifetime for all the run's series: a cron's next time is the same for
+	// every target and backend, and asking it per recorder is a search apiece.
+	every := r.every(now)
 	for _, tr := range runs {
 		if tr.fanout {
 			tr.rec.Gauge(SeriesBackendsUp, float64(tr.up))
 		}
-		r.publish(ctx, sink, tr.rec, now)
+		r.publish(ctx, sink, tr.rec, now, every)
 		for _, rec := range tr.backends {
-			r.publish(ctx, sink, rec, now)
+			r.publish(ctx, sink, rec, now, every)
 		}
 	}
+	// After the writes: the time and failures of a run are not shown before its samples.
+	r.published.Store(&Published{At: now, Failures: r.state().failures()})
 	return nil
 }
 
 // publish ships one recorder as the whole truth about its scope: a gauge the run
 // did not write is dropped.
-func (r *Runner) publish(ctx context.Context, sink metrics.Sink, rec *metrics.Recorder, now time.Time) {
+func (r *Runner) publish(ctx context.Context, sink metrics.Sink, rec *metrics.Recorder, now time.Time, every time.Duration) {
 	b := rec.Batch(now)
-	b.Scope, b.Every = rec.Base(), r.every(now)
+	b.Scope, b.Every = rec.Base(), every
 	sink.Write(ctx, b)
 }
 

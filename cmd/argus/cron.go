@@ -35,15 +35,16 @@ func cmdCron(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf(`usage: argus cron [-tz Europe/Moscow] [-n 5] [-after T] [-from T -to T] [-json] "0 * * * *"`)
+	if fs.NArg() == 0 {
+		return fmt.Errorf(`usage: argus cron [-tz Europe/Moscow] [-n 5] [-after T] [-from T -to T] [-json] "0 * * * *" ["30 18 * * *" ...]`)
 	}
 
 	loc, err := (config.Probe{Timezone: *tz}).Location()
 	if err != nil {
 		return err
 	}
-	c, err := config.ParseCron(fs.Arg(0), loc)
+	// Several specifications are one schedule, as a probe's cron: list is.
+	c, err := config.ParseCrons(fs.Args(), loc)
 	if err != nil {
 		return err
 	}

@@ -69,7 +69,7 @@ func (h *health) changed(key unitKey, scope metrics.Labels, ok bool, err error) 
 	previous := u.up
 	u.up, u.seen, u.scope, u.why = ok, true, scope, Failure{}
 	if !ok && err != nil {
-		u.why = Failure{Reason: ReasonOf(err), Message: Message(err)}
+		u.why = Failure{Reason: ReasonOf(err), Message: Message(err), Regex: RegexFailure(err)}
 	}
 	if !known {
 		return !ok
@@ -109,6 +109,9 @@ func (h *health) down() int {
 type Failure struct {
 	Reason  FailureReason
 	Message string
+	// Regex is set when the content check that failed was a regular expression:
+	// blackbox's probe_failed_due_to_regex is about exactly that.
+	Regex bool
 }
 
 func (h *health) failures() map[string]Failure {

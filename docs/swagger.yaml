@@ -231,6 +231,17 @@ paths:
           required: false
           description: An alias for `probe`, so an existing scrape config needs no rewriting.
           schema: {type: string}
+        - name: stored
+          in: query
+          required: false
+          description: |
+            `true` runs nothing and answers with what the probe's own runs last
+            measured: gauges and `probe_success`, a `# WARN backend is down …`
+            comment per failure of that run, `# INFO stored last_run=…` and,
+            with `probe_aliases`, the blackbox names. Nothing is sent to the
+            target, so it spends no quota. A read; not with `target` or
+            `hostname`. A value that is not a boolean is refused with 400.
+          schema: {type: boolean}
         - name: target
           in: query
           required: false
@@ -908,13 +919,18 @@ components:
         cron:
           type: string
           description: |
-            The probe's cron, when it runs on one rather than every interval.
-            `interval` is then the shortest gap between two of its runs.
-          example: "0 * * * *"
+            The probe's cron, when it runs on one rather than every interval;
+            several specifications are joined by "; ". `interval` is then the
+            shortest gap between two of its runs.
+          example: "15 9 * * *; 40 18 * * mon-fri"
         next_run:
           type: string
           format: date-time
           description: When the cron runs the probe next.
+        last_run:
+          type: string
+          format: date-time
+          description: When a run last published its results.
         quota: {$ref: "#/components/schemas/QuotaStatus"}
         requests_sent:
           type: integer

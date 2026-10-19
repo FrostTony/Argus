@@ -52,11 +52,11 @@ probes:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if list[0].Cron != "0 * * * *" || list[0].Interval != 0 {
+	if list[0].Cron.String() != "0 * * * *" || list[0].Interval != 0 {
 		t.Fatalf("on-cron: cron %q interval %s; the template's cron must replace the default interval",
 			list[0].Cron, list[0].Interval.D())
 	}
-	if list[1].Cron != "" || list[1].Interval.D() != 2*time.Minute {
+	if list[1].Cron.Set() || list[1].Interval.D() != 2*time.Minute {
 		t.Fatalf("back-to-interval: cron %q interval %s; the probe's interval must replace the cron",
 			list[1].Cron, list[1].Interval.D())
 	}
@@ -207,7 +207,7 @@ steps:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.Cron != "0 3 * * *" || p.Quota == nil || p.Quota.Requests != 30 || p.Timezone != "UTC" {
+	if p.Cron.String() != "0 3 * * *" || p.Quota == nil || p.Quota.Requests != 30 || p.Timezone != "UTC" {
 		t.Fatalf("scenario head lost a field: %+v", p)
 	}
 	_, err = ParseScenario([]byte(`

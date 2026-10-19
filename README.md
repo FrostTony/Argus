@@ -240,6 +240,10 @@ probes:
     targets: [https://api.example.com/v1/status]
 ```
 
+- `cron` may be a list, and the probe runs at every time any of them names:
+  `cron: ["15 9 * * *", "40 18 * * mon-fri"]` is 09:15 daily and 18:40 on
+  weekdays — one line would run at 09:40 and 18:15 as well. A time two of
+  them name runs once.
 - There is no jitter and no run at start: every node with this probe runs it
   at the same minute and at no other, a restart and a reload included. An
   interval probe runs as soon as it starts, after a random fraction of its
@@ -248,9 +252,12 @@ probes:
   restricted (neither starts with `*`), a day matching either runs.
 - `timeout` × `requests_per_probe` has to fit the shortest gap between two
   runs, the way it fits an interval; `interval` in `/status.json` is that gap.
+  It is measured over a whole turn of the calendar (28 years to come, in the
+  zone's rules of today), so a rare time among frequent ones — `5 0 1 6 *`
+  beside `*/10 * * * *` — and a clock going back by half an hour are counted.
 - A series written by a cron probe lives until its next run and `stale_after`
   past it, so the series of a weekday probe survive the weekend.
-- `argus cron [-tz zone] [-n 5] [-from T -to T] [-json] "expr"` lists the
+- `argus cron [-tz zone] [-n 5] [-from T -to T] [-json] "expr"...` lists the
   next runs, the shortest gap and the number of runs in a span — the
   arithmetic a renderer needs to show a request count before it pushes.
 
@@ -691,9 +698,20 @@ disappears stop being written and are retired after `stale_after`.
 | `POST /api/probes` | write | run a probe now, off its schedule (`?name=` for one); 429 when its quota is spent |
 | `GET\|POST /api/check` | read / write | run a check once and return the result as JSON |
 | `GET /probe?probe=X&target=Y` | read / write | run a check once and return it as a Prometheus exposition |
+| `GET /probe?probe=X&stored=true` | read | what the probe's own runs last measured, in the same form — nothing is run |
 | `GET /api/scenarios` | read | the scenarios this node runs, and each one's last run per target, step by step |
 | `GET /api/scenarios/{name}` | read | one of them |
 | `POST /api/scenarios/{name}/run` | write | start a scenario now, in the background: 202, or 409 while one is running |
+
+`/probe?stored=true` answers from the store instead of running the probe: the
+last run's gauges and `probe_success` per target, a `# WARN backend is down …`
+comment for each failure of that same run, worded as the `debug=true` trace
+words it, `# INFO stored last_run=…`, and the blackbox names when
+`probe_aliases` is on. Nothing goes to the target, so a page that polls it
+spends no quota and adds nothing to a cron's count — which is what a probe on
+a cron or a quota needs. It takes no `target=` or `hostname=`. `stored` is read
+as Go reads a boolean (`1`, `true`, `0`, `false`…); anything else is a 400, not
+a quiet "no" that would run the probe.
 
 `/probe` also takes `module=` as a synonym for `probe=` (blackbox's name for the
 same thing), `hostname=` to change the Host header and SNI without changing the

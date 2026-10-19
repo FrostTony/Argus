@@ -274,6 +274,37 @@ func (s *api) probeExposition(w http.ResponseWriter, r *http.Request) {
 		Hostname: q.Get("hostname"),
 		Debug:    q.Get("debug") == "true",
 	}
+	// stored=true reads what the probe's own runs last measured instead of
+	// running it: nothing goes to the target, so it spends no quota and adds
+	// nothing to a cron's count. It is a read, failures and all — the status
+	// page shows them to anyone — and it is about the configured targets only.
+	stored := false
+	if v := q.Get("stored"); v != "" {
+		var err error
+		// Anything but a clear yes or no is refused: read as "no", a typo would
+		// run the probe - the very request stored mode is there to avoid.
+		if stored, err = strconv.ParseBool(v); err != nil {
+			writeJSON(w, http.StatusBadRequest, errorBody{fmt.Sprintf("stored: want true or false, got %q", v)})
+			return
+		}
+	}
+	if stored {
+		if req.Target != "" || req.Hostname != "" {
+			writeJSON(w, http.StatusBadRequest, errorBody{"stored results are of the configured targets: " +
+				"target= and hostname= need a run"})
+			return
+		}
+		if !s.admit(w, r, false) {
+			return
+		}
+		exp, err := s.app.Stored(req.Probe)
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, errorBody{err.Error()})
+			return
+		}
+		s.writeExposition(w, r, exp)
+		return
+	}
 	// Choosing a target or the name presented to it sends the probe's
 	// credentials somewhere it was not configured to send them: a write. So is
 	// the trace, which carries what the target answered and what was asked of
@@ -290,6 +321,13 @@ func (s *api) probeExposition(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, checkStatus(w, err), errorBody{err.Error()})
 		return
 	}
+	s.writeExposition(w, r, exp)
+}
+
+// writeExposition renders one probe's samples, its log as comment lines
+// first: the scrape stays an exposition, and whoever holds curl reads the log.
+func (s *api) writeExposition(w http.ResponseWriter, r *http.Request, exp app.Exposition) {
+	ctx := r.Context()
 	exposition := s.app.Cfg.Exposition()
 
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

@@ -58,6 +58,8 @@ type ProbeStatus struct {
 	// next. Interval is then the shortest gap between two runs.
 	Cron    string `json:"cron,omitempty"`
 	NextRun string `json:"next_run,omitempty"`
+	// LastRun is when a run last published its results, in RFC 3339.
+	LastRun string `json:"last_run,omitempty"`
 	// Quota is the probe's count in its current period.
 	Quota *QuotaStatus `json:"quota,omitempty"`
 	// RequestsSent counts the requests the probe's runs sent its targets since
@@ -130,6 +132,9 @@ func (a *App) Status() Status {
 			Targets:      names,
 			Quota:        quotaStatus(r, now),
 			RequestsSent: r.Sent(),
+		}
+		if last := r.LastRun(); !last.IsZero() {
+			ps.LastRun = last.UTC().Format(time.RFC3339)
 		}
 		if r.Cron != nil {
 			ps.Cron = r.Cron.String()

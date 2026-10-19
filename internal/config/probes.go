@@ -70,7 +70,7 @@ type Probe struct {
 	Schedule *Schedule `yaml:"schedule,omitempty"`
 	// Cron runs the probe at the wall-clock times it names instead of every
 	// interval; a probe takes one or the other.
-	Cron string `yaml:"cron,omitempty"`
+	Cron Crons `yaml:"cron,omitempty"`
 	// Timezone, an IANA name, is what cron, the quota's periods and the
 	// schedule are read in; the node's local time when unset. A schedule's own
 	// timezone wins for the schedule.
@@ -136,7 +136,7 @@ func (p *Probe) UnmarshalYAML(n *yaml.Node) error {
 	}
 	*p = Probe(known)
 	// Within one layer; a layer below gives one up to the layer above.
-	if p.Cron != "" && p.Interval != 0 {
+	if p.Cron.Set() && p.Interval != 0 {
 		return fmt.Errorf("line %d: interval and cron are alternatives: give one", n.Line)
 	}
 
@@ -410,8 +410,8 @@ func (p Probe) validate() error {
 		return err
 	}
 	var cron *Cron
-	if p.Cron != "" {
-		if cron, err = ParseCron(p.Cron, loc); err != nil {
+	if p.Cron.Set() {
+		if cron, err = ParseCrons(p.Cron, loc); err != nil {
 			return err
 		}
 	}
@@ -515,10 +515,10 @@ func (p Probe) mergeFrom(other Probe) Probe {
 	// The cadence comes whole from the layer that sets one: a cron given over
 	// an inherited interval replaces it, and the other way round.
 	switch {
-	case other.Cron != "":
+	case other.Cron.Set():
 		res.Cron, res.Interval = other.Cron, 0
 	case other.Interval != 0:
-		res.Interval, res.Cron = other.Interval, ""
+		res.Interval, res.Cron = other.Interval, nil
 	}
 	res.Timezone = cmp.Or(other.Timezone, p.Timezone)
 	if other.Quota != nil {

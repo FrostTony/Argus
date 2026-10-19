@@ -3,8 +3,10 @@ package config
 import (
 	"fmt"
 	"math/bits"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -17,7 +19,17 @@ import (
 // Day of month and day of week combine as in Vixie cron: when both are
 // restricted — neither starts with "*" or "?" — a day matching either runs;
 // otherwise a day must match both.
+//
+// A Cron may hold several specifications and runs at every time any of them
+// names: "09:15 and 18:40" is two lines in a crontab, since one line runs at
+// every hour it lists times every minute it lists.
 type Cron struct {
+	specs []*cronSpec
+	loc   *time.Location
+}
+
+// cronSpec is one specification: one line of a crontab.
+type cronSpec struct {
 	expr string
 	loc  *time.Location
 
@@ -63,9 +75,30 @@ var (
 
 // ParseCron compiles a specification for loc; nil loc is the node's local time.
 func ParseCron(expr string, loc *time.Location) (*Cron, error) {
+	return ParseCrons([]string{expr}, loc)
+}
+
+// ParseCrons compiles several specifications into one schedule that runs at
+// every time any of them names. A time two of them name runs once.
+func ParseCrons(exprs []string, loc *time.Location) (*Cron, error) {
 	if loc == nil {
 		loc = time.Local
 	}
+	if len(exprs) == 0 {
+		return nil, fmt.Errorf("cron: no specification")
+	}
+	c := &Cron{loc: loc}
+	for _, expr := range exprs {
+		spec, err := parseSpec(expr, loc)
+		if err != nil {
+			return nil, err
+		}
+		c.specs = append(c.specs, spec)
+	}
+	return c, nil
+}
+
+func parseSpec(expr string, loc *time.Location) (*cronSpec, error) {
 	text := strings.TrimSpace(expr)
 	if strings.HasPrefix(text, "@") {
 		if strings.HasPrefix(text, "@every") {
@@ -82,7 +115,7 @@ func ParseCron(expr string, loc *time.Location) (*Cron, error) {
 		return nil, fmt.Errorf("cron %q: want 5 fields (minute hour day-of-month month day-of-week), got %d", expr, len(parts))
 	}
 
-	c := &Cron{expr: strings.TrimSpace(expr), loc: loc}
+	c := &cronSpec{expr: strings.TrimSpace(expr), loc: loc}
 	sets := [5]*uint64{&c.minute, &c.hour, &c.dom, &c.month, &c.dow}
 	for i, part := range parts {
 		set, err := cronFields[i].parse(part)
@@ -169,27 +202,47 @@ func (f cronField) value(s string) (int, error) {
 	return v, nil
 }
 
-// String is the specification as written.
-func (c *Cron) String() string { return c.expr }
+// String is the specifications as written, joined by "; ".
+func (c *Cron) String() string { return strings.Join(c.Exprs(), "; ") }
+
+// Exprs is the specifications as written, in the order given.
+func (c *Cron) Exprs() []string {
+	out := make([]string, len(c.specs))
+	for i, s := range c.specs {
+		out[i] = s.expr
+	}
+	return out
+}
 
 // Location is the time zone the specification is read in.
 func (c *Cron) Location() *time.Location { return c.loc }
 
+// Next is the first time strictly after t any of the specifications names,
+// or the zero time when there is none within the horizon.
+func (c *Cron) Next(after time.Time) time.Time {
+	var best time.Time
+	for _, s := range c.specs {
+		if t := s.Next(after); !t.IsZero() && (best.IsZero() || t.Before(best)) {
+			best = t
+		}
+	}
+	return best
+}
+
 // Next is the first time strictly after t the specification names, or the
 // zero time when there is none within the horizon.
 //
-// Clock changes go as in Vixie cron. A time the clock skips forward over does
-// not run that day. When the clock goes back and repeats an hour, a
-// specification that names hours runs once, at the first of the two; one on
-// every hour ("*/5 * * * *") keeps its pace through both.
-func (c *Cron) Next(after time.Time) time.Time {
+// Clock changes: a time the clock skips forward over does not run that day
+// (Vixie cron would run it late, after a jump of under three hours). When the
+// clock goes back and repeats an hour, a specification that names hours runs
+// once, at the first of the two, as in Vixie; one on all 24 hours ("*/5 * * * *")
+// keeps its pace through both.
+func (c *cronSpec) Next(after time.Time) time.Time {
 	// Truncated on the instant, never rebuilt from the wall clock: in an hour
 	// the clock repeats, time.Date names the first of the two, and a search
 	// started there walks back before after and round the same hour forever.
 	t := after.In(c.loc).Truncate(time.Minute).Add(time.Minute)
 	limit := t.AddDate(0, 0, cronHorizon)
-	// A wall-clock time already passed is not run again in a repeated hour.
-	seen := wallClock(after.In(c.loc))
 	everyHour := bits.OnesCount64(c.hour) == 24
 
 	for t.Before(limit) {
@@ -203,13 +256,29 @@ func (c *Cron) Next(after time.Time) time.Time {
 			// passed over and a repeated one is walked through once.
 			t = t.Add(time.Duration(60-t.Minute()) * time.Minute)
 		case c.minute&(1<<uint(t.Minute())) == 0,
-			!everyHour && !wallClock(t).After(seen):
+			// A wall-clock time the clock already showed this day is not run
+			// again: whatever the search started from — a time of another
+			// specification of the same cron among them.
+			!everyHour && repeated(t):
 			t = t.Add(time.Minute)
 		default:
 			return t
 		}
 	}
 	return time.Time{}
+}
+
+// repeated reports whether t's wall-clock reading was already shown earlier, in
+// an hour the clock went back over: by half an hour on Lord Howe Island, by
+// three hours at Casey station, by one or two anywhere else.
+func repeated(t time.Time) bool {
+	wall := wallClock(t)
+	for _, back := range [...]time.Duration{30 * time.Minute, time.Hour, 2 * time.Hour, 3 * time.Hour} {
+		if wallClock(t.Add(-back)).Equal(wall) {
+			return true
+		}
+	}
+	return false
 }
 
 // dayStart is the first instant of the date in loc; the date is normalised as
@@ -231,7 +300,7 @@ func wallClock(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), t.Minute(), 0, 0, time.UTC)
 }
 
-func (c *Cron) dayMatches(t time.Time) bool {
+func (c *cronSpec) dayMatches(t time.Time) bool {
 	dom := c.dom&(1<<uint(t.Day())) != 0
 	dow := c.dow&(1<<uint(t.Weekday())) != 0
 	if c.domStar || c.dowStar {
@@ -241,36 +310,304 @@ func (c *Cron) dayMatches(t time.Time) bool {
 }
 
 // MinGap is the shortest time between two runs: what a run, its timeout and
-// its repeats must fit into, as they fit into an interval. It is measured from
-// a fixed day, so the answer does not depend on when it is asked: over a year
-// of runs, or, for a schedule dense enough that a year is a long walk, over
-// 2000 runs and at least eight days — every kind of day boundary, the week's
-// included, is in there.
+// its repeats must fit into, as they fit into an interval.
+//
+// It is measured over a whole turn of the calendar — 28 years from 2025, every
+// date on every weekday, every kind of year — so the answer does not depend on
+// when it is asked, and no run is missed however rarely it comes: a sparse
+// specification among dense ones, the 29th of February. A day the clock does
+// not change on runs at its specifications' times on the clock, so such days
+// are measured once per set of specifications that match them; a day it
+// changes on is walked run by run, which is where a clock going back by half
+// an hour brings two runs closer than their times on the clock say.
 func (c *Cron) MinGap() time.Duration {
 	// A gap is never shorter than a minute; every minute of an hour is that.
-	if bits.OnesCount64(c.minute) == 60 {
-		return time.Minute
+	for _, s := range c.specs {
+		if bits.OnesCount64(s.minute) == 60 {
+			return time.Minute
+		}
 	}
-	start := time.Date(2024, 1, 1, 0, 0, 0, 0, c.loc)
-	end := start.AddDate(1, 0, 1)
-	first := c.Next(start.Add(-time.Minute))
-	gap := time.Duration(0)
-	prev := first
-	for runs := 1; !prev.IsZero(); runs++ {
-		next := c.Next(prev)
-		if next.IsZero() {
-			break
-		}
-		if d := next.Sub(prev); gap == 0 || d < gap {
-			gap = d
-		}
-		dense := runs >= 2000 && next.Sub(first) >= 8*24*time.Hour
-		if gap == time.Minute || dense || next.After(end) {
-			break
-		}
-		prev = next
+	key := c.loc.String() + "\x00" + strings.Join(c.Exprs(), "\x00")
+	gapCache.Lock()
+	gap, ok := gapCache.m[key]
+	gapCache.Unlock()
+	if ok {
+		return gap
 	}
+	gap = c.measureGap()
+	gapCache.Lock()
+	// Bounded: a node's configuration names a few hundred specifications, so a
+	// full cache is a config churning through new ones; start over.
+	if len(gapCache.m) >= 4096 {
+		clear(gapCache.m)
+	}
+	gapCache.m[key] = gap
+	gapCache.Unlock()
 	return gap
+}
+
+// gapCache keeps MinGap by zone and specifications: validation asks it for
+// every cron probe of every configuration a node is given, and a reload asks
+// again for the probes that changed.
+var gapCache = struct {
+	sync.Mutex
+	m map[string]time.Duration
+}{m: map[string]time.Duration{}}
+
+// dayShape is a day without a clock change, in minutes of the day: its first
+// and last run and the shortest gap between its runs, zero for a single run.
+type dayShape struct{ first, last, gap int }
+
+func (c *Cron) measureGap() time.Duration { return c.gapOver(gapSpanStart, gapSpanEnd) }
+
+// gapOver measures MinGap over the years [from, to) of the span.
+func (c *Cron) gapOver(from, to int) time.Duration {
+	var (
+		gap     time.Duration
+		prev    time.Time // the last run so far
+		shapes  = map[string]dayShape{}
+		match   = make([]byte, len(c.specs))
+		pending []time.Time
+	)
+	note := func(t time.Time) {
+		if !prev.IsZero() {
+			if d := t.Sub(prev); gap == 0 || d < gap {
+				gap = d
+			}
+		}
+		prev = t
+	}
+	// The runs of days the clock changes on are taken in the order of time, not of
+	// dates: a clock going back across midnight (Casey: 02:00 to 23:00 the day
+	// before) shows yesterday's last hours again after today's first runs.
+	flush := func() {
+		slices.SortFunc(pending, time.Time.Compare)
+		for i, t := range pending {
+			if i == 0 || !t.Equal(pending[i-1]) {
+				note(t)
+			}
+		}
+		pending = pending[:0]
+	}
+	zs := spanOf(c.loc)
+	end := time.Date(to, 1, 1, 0, 0, 0, 0, time.UTC)
+	for date := time.Date(from, 1, 1, 0, 0, 0, 0, time.UTC); date.Before(end); date = date.AddDate(0, 0, 1) {
+		matched := false
+		for i, s := range c.specs {
+			match[i] = 0
+			if s.month&(1<<uint(date.Month())) != 0 && s.dayMatches(date) {
+				match[i], matched = 1, true
+			}
+		}
+		// date is the day's wall clock read as UTC: an instant is it less the offset.
+		off, steady := zs.steady(date)
+		if !steady {
+			if matched {
+				for i, s := range c.specs {
+					if match[i] != 0 {
+						pending = s.dayRuns(date, zs, pending)
+					}
+				}
+			}
+			continue
+		}
+		if len(pending) > 0 {
+			flush()
+		}
+		if !matched {
+			continue
+		}
+		sh, ok := shapes[string(match)]
+		if !ok {
+			sh = c.shape(match)
+			shapes[string(match)] = sh
+		}
+		start := date.Add(-off)
+		note(start.Add(time.Duration(sh.first) * time.Minute))
+		if sh.gap > 0 && (gap == 0 || time.Duration(sh.gap)*time.Minute < gap) {
+			gap = time.Duration(sh.gap) * time.Minute
+		}
+		prev = start.Add(time.Duration(sh.last) * time.Minute)
+	}
+	flush()
+	return gap
+}
+
+// dayRuns appends the specification's runs on a day the clock changes on, as
+// Next finds them. A time on the clock is each offset of the day taken from it,
+// where that offset is in force then: none in a gap the clock skips, two in an
+// hour it repeats - of which a specification that names hours keeps the first.
+func (c *cronSpec) dayRuns(date time.Time, zs *zoneSpan, out []time.Time) []time.Time {
+	offsets := zs.around(date)
+	everyHour := bits.OnesCount64(c.hour) == 24
+	for h := 0; h < 24; h++ {
+		if c.hour&(1<<uint(h)) == 0 {
+			continue
+		}
+		for m := 0; m < 60; m++ {
+			if c.minute&(1<<uint(m)) == 0 {
+				continue
+			}
+			wall := date.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute)
+			var found [4]time.Time
+			n := 0
+			for _, o := range offsets {
+				if t := wall.Add(-o); zs.offsetAt(t) == o && n < len(found) {
+					found[n], n = t, n+1
+				}
+			}
+			slices.SortFunc(found[:n], time.Time.Compare)
+			if n > 1 && !everyHour {
+				n = 1
+			}
+			out = append(out, found[:n]...)
+		}
+	}
+	return out
+}
+
+// zoneSpan is a zone's offset changes over the span MinGap walks, found once
+// per zone: past the zone's table, Go reads its rule afresh on every lookup,
+// and a lookup per run of every day of 28 years is most of the cost.
+type zoneSpan struct {
+	first   time.Duration // the offset at the start
+	changes []zoneChange  // in order
+}
+
+type zoneChange struct {
+	at            time.Time // the first instant of the new offset
+	before, after time.Duration
+}
+
+var zoneSpans sync.Map // zone name -> *zoneSpan
+
+func spanOf(loc *time.Location) *zoneSpan {
+	if v, ok := zoneSpans.Load(loc.String()); ok {
+		return v.(*zoneSpan)
+	}
+	offsetOf := func(t time.Time) time.Duration {
+		_, s := t.In(loc).Zone()
+		return time.Duration(s) * time.Second
+	}
+	// A day before the span and a day after it: the days at its edges are judged
+	// by the clock either side of them.
+	t := time.Date(gapSpanStart, 1, 1, 0, 0, 0, 0, time.UTC).Add(-48 * time.Hour)
+	end := time.Date(gapSpanEnd, 1, 1, 0, 0, 0, 0, time.UTC).Add(48 * time.Hour)
+	zs := &zoneSpan{first: offsetOf(t)}
+	cur := zs.first
+	// Clocks change at most once in a few hours, never twice in twelve: a look
+	// every twelve hours sees each change, and a halving search finds its minute.
+	for step := 12 * time.Hour; t.Before(end); t = t.Add(step) {
+		next := offsetOf(t.Add(step))
+		if next == cur {
+			continue
+		}
+		// In whole seconds: clocks change on one, and an instant half a second
+		// late would lose a time on the clock that starts right at the change.
+		lo, hi := t.Unix(), t.Add(step).Unix()
+		for hi-lo > 1 {
+			mid := lo + (hi-lo)/2
+			if offsetOf(time.Unix(mid, 0)) == cur {
+				lo = mid
+			} else {
+				hi = mid
+			}
+		}
+		zs.changes = append(zs.changes, zoneChange{at: time.Unix(hi, 0).UTC(), before: cur, after: next})
+		cur = next
+	}
+	v, _ := zoneSpans.LoadOrStore(loc.String(), zs)
+	return v.(*zoneSpan)
+}
+
+// offsetAt is the offset in force at t.
+func (zs *zoneSpan) offsetAt(t time.Time) time.Duration {
+	i, _ := slices.BinarySearchFunc(zs.changes, t, func(c zoneChange, t time.Time) int {
+		if c.at.After(t) {
+			return 1
+		}
+		return -1
+	})
+	if i == 0 {
+		return zs.first
+	}
+	return zs.changes[i-1].after
+}
+
+// window is the instants a wall-clock day can fall on, whatever the offset
+// (they reach -12 and +14 hours), widened by three hours either side - the
+// furthest a clock has gone back, so a day whose midnight came round twice is
+// seen as one the clock changed on.
+func window(date time.Time) (time.Time, time.Time) {
+	return date.Add(-17 * time.Hour), date.Add(24*time.Hour + 15*time.Hour)
+}
+
+// steady reports the day's offset when the clock keeps it all day.
+func (zs *zoneSpan) steady(date time.Time) (time.Duration, bool) {
+	from, to := window(date)
+	i, _ := slices.BinarySearchFunc(zs.changes, from, func(c zoneChange, t time.Time) int {
+		if c.at.Before(t) {
+			return -1
+		}
+		return 1
+	})
+	if i < len(zs.changes) && zs.changes[i].at.Before(to) {
+		return 0, false
+	}
+	return zs.offsetAt(from), true
+}
+
+// around is the offsets the clock shows over a day that changes.
+func (zs *zoneSpan) around(date time.Time) []time.Duration {
+	from, to := window(date)
+	out := []time.Duration{zs.offsetAt(from)}
+	for _, c := range zs.changes {
+		if !c.at.Before(from) && c.at.Before(to) && !slices.Contains(out, c.after) {
+			out = append(out, c.after)
+		}
+	}
+	return out
+}
+
+// The span MinGap walks: a whole turn of the Gregorian calendar within a
+// century, which needs no century rule. Years to come, which a zone keeps by
+// its rules of today; past ones keep the rules of their day, and Moscow, which
+// changed its clocks until 2011, would shorten a gap no run will see again.
+const gapSpanStart, gapSpanEnd = 2025, 2053
+
+// shape is the day the matching specifications make together, by the clock.
+func (c *Cron) shape(match []byte) dayShape {
+	var on [24 * 60]bool
+	for i, s := range c.specs {
+		if match[i] == 0 {
+			continue
+		}
+		for h := 0; h < 24; h++ {
+			if s.hour&(1<<uint(h)) == 0 {
+				continue
+			}
+			for m := 0; m < 60; m++ {
+				if s.minute&(1<<uint(m)) != 0 {
+					on[h*60+m] = true
+				}
+			}
+		}
+	}
+	sh, last := dayShape{first: -1}, -1
+	for m, run := range on {
+		if !run {
+			continue
+		}
+		if sh.first < 0 {
+			sh.first = m
+		}
+		if last >= 0 && (sh.gap == 0 || m-last < sh.gap) {
+			sh.gap = m - last
+		}
+		last = m
+	}
+	sh.last = last
+	return sh
 }
 
 // Runs counts the runs in [from, to).

@@ -240,7 +240,7 @@ func (a *App) checkConfig(req CheckRequest) (config.Probe, error) {
 	}
 	// A one-off check has no interval to fit into, so any timeout fits, and
 	// no cron to wait for.
-	pc.Cron = ""
+	pc.Cron = nil
 	pc.Interval = max(pc.Interval, a.Cfg.Probing.Interval,
 		config.Duration(max(1, pc.RequestsPerProbe))*pc.Timeout)
 	enabled := false

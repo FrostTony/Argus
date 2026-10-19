@@ -272,6 +272,39 @@ func (s *Store) Snapshot() []Sample {
 	return s.snapshotLocked(now)
 }
 
+// Select is the live series keep accepts, sorted as Snapshot sorts them. It
+// copies only what it keeps and never reorders, so a reader after one probe's
+// series pays for those, not for the node's.
+func (s *Store) Select(keep func(Sample) bool) []Sample {
+	now := s.now().UnixNano()
+	type kept struct {
+		key    string
+		sample Sample
+	}
+	var found []kept
+	s.mu.RLock()
+	for _, se := range s.series {
+		if !se.live(now) || !keep(se.sample) {
+			continue
+		}
+		v := se.sample.Value
+		if d, ok := v.(*Dist); ok {
+			// A write after the read lock is released must not change the copy.
+			cp := *d
+			cp.Counts = slices.Clone(d.Counts)
+			v = &cp
+		}
+		found = append(found, kept{se.key, Sample{Name: se.sample.Name, Labels: se.sample.Labels, Value: v}})
+	}
+	s.mu.RUnlock()
+	slices.SortFunc(found, func(a, b kept) int { return strings.Compare(a.key, b.key) })
+	out := make([]Sample, len(found))
+	for i, k := range found {
+		out[i] = k.sample
+	}
+	return out
+}
+
 // snapshotLocked reads the order as it stands. A write landing between the
 // reorder and the read lock may have removed series from it, so it checks each.
 func (s *Store) snapshotLocked(now int64) []Sample {

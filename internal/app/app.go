@@ -398,8 +398,8 @@ func (a *App) buildRunner(pc config.Probe, nodeLabels metrics.Labels) (*probe.Ru
 		return nil, fmt.Errorf("probe %q: %w", pc.Name, err)
 	}
 	var cron *config.Cron
-	if pc.Cron != "" {
-		if cron, err = config.ParseCron(pc.Cron, loc); err != nil {
+	if pc.Cron.Set() {
+		if cron, err = config.ParseCrons(pc.Cron, loc); err != nil {
 			return nil, fmt.Errorf("probe %q: %w", pc.Name, err)
 		}
 		// What has to fit between two runs — the timeout and its repeats, a

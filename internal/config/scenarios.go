@@ -44,7 +44,7 @@ type scenarioHead struct {
 	Targets         Targets           `yaml:"targets"`
 	RunOn           string            `yaml:"run_on"`
 	Schedule        *Schedule         `yaml:"schedule"`
-	Cron            string            `yaml:"cron"`
+	Cron            Crons             `yaml:"cron"`
 	Timezone        string            `yaml:"timezone"`
 	Quota           *Quota            `yaml:"quota"`
 	SourceIP        string            `yaml:"source_ip"`
@@ -93,7 +93,7 @@ func (f *scenarioFile) UnmarshalYAML(n *yaml.Node) error {
 	if err := head.Decode(&h); err != nil {
 		return err
 	}
-	if h.Cron != "" && h.Interval != 0 {
+	if h.Cron.Set() && h.Interval != 0 {
 		return fmt.Errorf("line %d: interval and cron are alternatives: give one", n.Line)
 	}
 	f.probe = Probe{
@@ -163,7 +163,7 @@ func LoadScenarios(paths ...string) ([]Probe, error) {
 // that runs for minutes and changes the target on every run gets neither by
 // accident.
 func (p Probe) validateScenario() error {
-	if (p.Interval == 0 && p.Cron == "") || p.Timeout == 0 {
+	if (p.Interval == 0 && !p.Cron.Set()) || p.Timeout == 0 {
 		return fmt.Errorf("scenario %q: interval and timeout are required; cron may stand for the interval", p.Name)
 	}
 	if p.Targets.Empty() {

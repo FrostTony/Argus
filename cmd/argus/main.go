@@ -58,7 +58,7 @@ argus ` + version + ` - active monitoring for domains
   argus run       -config argus.yaml -state probes.yaml    run the node on what the API pushes
   argus validate  -config argus.yaml -probes probes.d/     check the configuration
   argus oneshot   -probes probes.d/ [-probe name]          run every probe once and print metrics
-  argus cron      [-tz zone] [-n 5] [-json] "0 * * * *"    when a cron runs, and how often
+  argus cron      [-tz zone] [-n 5] [-json] "0 * * * *"... when a cron runs, and how often
   argus kinds                                              list probe types
   argus version
 
